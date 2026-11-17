@@ -1,0 +1,416 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Default deny catch-all
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() > 0 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function isOwner(ownerId) {
+      return isSignedIn() && request.auth.uid == ownerId;
+    }
+
+    // --- Users Collection ---
+    match /users/{userId} {
+      function isValidUser(data) {
+        return data.keys().hasAll(['uid', 'email']) &&
+               data.keys().hasOnly([
+                 'uid',
+                 'email',
+                 'displayName',
+                 'photoURL',
+                 'tourCompleted',
+                 'tourSkipped',
+                 'tourUpdatedAt',
+                 'createdAt',
+                 'updatedAt'
+               ]) &&
+               data.uid is string && data.uid == request.auth.uid && data.uid == userId &&
+               data.email is string && data.email.size() <= 256 &&
+               (!('displayName' in data) || (data.displayName is string && data.displayName.size() <= 128)) &&
+               (!('photoURL' in data) || (data.photoURL is string && data.photoURL.size() <= 512)) &&
+               (!('tourCompleted' in data) || data.tourCompleted is bool) &&
+               (!('tourSkipped' in data) || data.tourSkipped is bool) &&
+               (!('tourUpdatedAt' in data) || (data.tourUpdatedAt is string && data.tourUpdatedAt.size() <= 64)) &&
+               (!('createdAt' in data) || (data.createdAt is string && data.createdAt.size() <= 64)) &&
+               (!('updatedAt' in data) || (data.updatedAt is string && data.updatedAt.size() <= 64));
+      }
+
+      allow get: if isSignedIn() && request.auth.uid == userId && isValidId(userId);
+      allow list: if false;
+      allow create: if isSignedIn() &&
+                       request.auth.uid == userId &&
+                       isValidId(userId) &&
+                       isValidUser(request.resource.data);
+      allow update: if isSignedIn() &&
+                       request.auth.uid == userId &&
+                       isValidId(userId) &&
+                       isValidUser(request.resource.data) &&
+                       resource.data.uid == request.auth.uid &&
+                       request.resource.data.uid == resource.data.uid &&
+                       (!('createdAt' in resource.data) || request.resource.data.createdAt == resource.data.createdAt);
+      allow delete: if false;
+    }
+
+    // --- Code Projects Collection ---
+    match /codeProjects/{projectId} {
+      function isValidCodeProject(data) {
+        return data.keys().hasAll(['id', 'ownerId', 'name', 'language', 'files']) &&
+               data.keys().hasOnly([
+                 'id',
+                 'ownerId',
+                 'name',
+                 'language',
+                 'framework',
+                 'database',
+                 'description',
+                 'requirements',
+                 'architectureOverview',
+                 'runInstructions',
+                 'files',
+                 'versions',
+                 'createdAt',
+                 'updatedAt',
+                 'migratedFromGuestId',
+                 'migratedAt'
+               ]) &&
+               data.id is string && data.id == projectId && data.id.size() <= 128 &&
+               data.ownerId is string && data.ownerId == request.auth.uid && data.ownerId.size() <= 128 &&
+               data.name is string && data.name.size() > 0 && data.name.size() <= 128 &&
+               data.language is string && data.language.size() <= 64 &&
+               (!('framework' in data) || (data.framework is string && data.framework.size() <= 64)) &&
+               (!('database' in data) || (data.database is string && data.database.size() <= 64)) &&
+               (!('description' in data) || (data.description is string && data.description.size() <= 4096)) &&
+               (!('requirements' in data) || (data.requirements is string && data.requirements.size() <= 8192)) &&
+               (!('architectureOverview' in data) || (data.architectureOverview is string && data.architectureOverview.size() <= 8192)) &&
+               (!('runInstructions' in data) || (data.runInstructions is string && data.runInstructions.size() <= 4096)) &&
+               data.files is list && data.files.size() <= 100 &&
+               (!('versions' in data) || (data.versions is list && data.versions.size() <= 50)) &&
+               (!('createdAt' in data) || (data.createdAt is string && data.createdAt.size() <= 64)) &&
+               (!('updatedAt' in data) || (data.updatedAt is string && data.updatedAt.size() <= 64)) &&
+               (!('migratedFromGuestId' in data) || (data.migratedFromGuestId is string && data.migratedFromGuestId.size() <= 128)) &&
+               (!('migratedAt' in data) || (data.migratedAt is string && data.migratedAt.size() <= 64));
+      }
+
+      allow get: if isSignedIn() && isValidId(projectId) && resource != null && resource.data.ownerId == request.auth.uid;
+      allow list: if isSignedIn() && resource.data.ownerId == request.auth.uid;
+      allow create: if isSignedIn() && isValidId(projectId) && isValidCodeProject(request.resource.data);
+      allow update: if isSignedIn() &&
+                       isValidId(projectId) &&
+                       isValidCodeProject(request.resource.data) &&
+                       resource.data.ownerId == request.auth.uid &&
+                       request.resource.data.ownerId == resource.data.ownerId &&
+                       request.resource.data.id == resource.data.id &&
+                       request.resource.data.id == projectId &&
+                       (!('createdAt' in resource.data) || request.resource.data.createdAt == resource.data.createdAt);
+      allow delete: if isSignedIn() && isValidId(projectId) && resource.data.ownerId == request.auth.uid;
+    }
+
+    // --- Website Projects Collection ---
+    match /websiteProjects/{projectId} {
+      function isValidWebsiteProject(data) {
+        return data.keys().hasAll(['id', 'ownerId', 'name', 'category', 'fileManifest']) &&
+               data.keys().hasOnly([
+                 'id',
+                 'ownerId',
+                 'name',
+                 'category',
+                 'technology',
+                 'designDirection',
+                 'description',
+                 'requirements',
+                 'summary',
+                 'fileManifest',
+                 'isPublished',
+                 'publishedAt',
+                 'publishedUrl',
+                 'publishedManifest',
+                 'snapshotVersion',
+                 'isPublic',
+                 'createdAt',
+                 'updatedAt',
+                 'migratedFromGuestId',
+                 'migratedAt'
+               ]) &&
+               data.id is string && data.id == projectId && data.id.size() <= 128 &&
+               data.ownerId is string && data.ownerId == request.auth.uid && data.ownerId.size() <= 128 &&
+               data.name is string && data.name.size() > 0 && data.name.size() <= 128 &&
+               data.category is string && data.category.size() <= 64 &&
+               (!('technology' in data) || (data.technology is string && data.technology.size() <= 64)) &&
+               (!('designDirection' in data) || (data.designDirection is string && data.designDirection.size() <= 64)) &&
+               (!('description' in data) || (data.description is string && data.description.size() <= 4096)) &&
+               (!('requirements' in data) || (data.requirements is string && data.requirements.size() <= 8192)) &&
+               (!('summary' in data) || (data.summary is string && data.summary.size() <= 4096)) &&
+               data.fileManifest is list && data.fileManifest.size() <= 100 &&
+               (!('isPublished' in data) || data.isPublished is bool) &&
+               (!('publishedAt' in data) || (data.publishedAt is string && data.publishedAt.size() <= 64)) &&
+               (!('publishedUrl' in data) || (data.publishedUrl is string && data.publishedUrl.size() <= 512)) &&
+               (!('publishedManifest' in data) || (data.publishedManifest is list && data.publishedManifest.size() <= 100)) &&
+               (!('snapshotVersion' in data) || (data.snapshotVersion is int && data.snapshotVersion >= 1)) &&
+               (!('isPublic' in data) || data.isPublic is bool) &&
+               (!('createdAt' in data) || (data.createdAt is string && data.createdAt.size() <= 64)) &&
+               (!('updatedAt' in data) || (data.updatedAt is string && data.updatedAt.size() <= 64)) &&
+               (!('migratedFromGuestId' in data) || (data.migratedFromGuestId is string && data.migratedFromGuestId.size() <= 128)) &&
+               (!('migratedAt' in data) || (data.migratedAt is string && data.migratedAt.size() <= 64));
+      }
+
+      allow get: if isSignedIn() && isValidId(projectId) && resource != null && resource.data.ownerId == request.auth.uid;
+      allow list: if isSignedIn() && resource.data.ownerId == request.auth.uid;
+      allow create: if isSignedIn() && isValidId(projectId) && isValidWebsiteProject(request.resource.data);
+      allow update: if isSignedIn() &&
+                       isValidId(projectId) &&
+                       isValidWebsiteProject(request.resource.data) &&
+                       resource.data.ownerId == request.auth.uid &&
+                       request.resource.data.ownerId == resource.data.ownerId &&
+                       request.resource.data.id == resource.data.id &&
+                       request.resource.data.id == projectId &&
+                       (!('createdAt' in resource.data) || request.resource.data.createdAt == resource.data.createdAt);
+      allow delete: if isSignedIn() && isValidId(projectId) && resource.data.ownerId == request.auth.uid;
+    }
+
+    // --- Published Websites Snapshots Collection ---
+    match /publishedWebsites/{projectId} {
+      function isValidPublishedWebsite(data) {
+        return data.keys().hasAll([
+                 'projectId',
+                 'ownerId',
+                 'name',
+                 'fileManifest',
+                 'compiledHtml',
+                 'publishedAt',
+                 'snapshotVersion',
+                 'isPublic'
+               ]) &&
+               data.keys().hasOnly([
+                 'projectId',
+                 'ownerId',
+                 'name',
+                 'category',
+                 'framework',
+                 'technology',
+                 'designDirection',
+                 'description',
+                 'summary',
+                 'fileManifest',
+                 'entryHtml',
+                 'dependencies',
+                 'compiledHtml',
+                 'publishedAt',
+                 'publishedUrl',
+                 'snapshotVersion',
+                 'isPublic',
+                 'updatedAt'
+               ]) &&
+               data.projectId is string && data.projectId == projectId && data.projectId.size() <= 128 &&
+               data.ownerId is string && data.ownerId == request.auth.uid && data.ownerId.size() <= 128 &&
+               data.name is string && data.name.size() > 0 && data.name.size() <= 128 &&
+               (!('category' in data) || (data.category is string && data.category.size() <= 64)) &&
+               (!('framework' in data) || (data.framework is string && data.framework.size() <= 64)) &&
+               (!('technology' in data) || (data.technology is string && data.technology.size() <= 64)) &&
+               (!('designDirection' in data) || (data.designDirection is string && data.designDirection.size() <= 64)) &&
+               (!('description' in data) || (data.description is string && data.description.size() <= 4096)) &&
+               (!('summary' in data) || (data.summary is string && data.summary.size() <= 4096)) &&
+               data.fileManifest is list && data.fileManifest.size() > 0 && data.fileManifest.size() <= 100 &&
+               (!('entryHtml' in data) || (data.entryHtml is string && data.entryHtml.size() <= 200000)) &&
+               (!('dependencies' in data) || data.dependencies is map) &&
+               data.compiledHtml is string && data.compiledHtml.size() > 0 && data.compiledHtml.size() <= 850000 &&
+               data.publishedAt is string && data.publishedAt.size() > 0 && data.publishedAt.size() <= 64 &&
+               (!('publishedUrl' in data) || (data.publishedUrl is string && data.publishedUrl.size() <= 512)) &&
+               data.snapshotVersion is int && data.snapshotVersion >= 1 &&
+               data.isPublic is bool &&
+               (!('updatedAt' in data) || (data.updatedAt is string && data.updatedAt.size() <= 64));
+      }
+
+      allow get: if isValidId(projectId) &&
+                    resource != null &&
+                    (resource.data.isPublic == true ||
+                    (isSignedIn() && resource.data.ownerId == request.auth.uid));
+      allow list: if isSignedIn() && resource.data.ownerId == request.auth.uid;
+      allow create: if isSignedIn() && isValidId(projectId) && isValidPublishedWebsite(request.resource.data);
+      allow update: if isSignedIn() &&
+                       isValidId(projectId) &&
+                       isValidPublishedWebsite(request.resource.data) &&
+                       resource.data.ownerId == request.auth.uid &&
+                       request.resource.data.ownerId == resource.data.ownerId &&
+                       request.resource.data.projectId == resource.data.projectId &&
+                       request.resource.data.projectId == projectId &&
+                       request.resource.data.snapshotVersion >= resource.data.snapshotVersion;
+      allow delete: if isSignedIn() && isValidId(projectId) && resource.data.ownerId == request.auth.uid;
+    }
+
+    // --- Documents Collection ---
+    match /documents/{documentId} {
+      function isValidDocument(data) {
+        return data.keys().hasAll(['id', 'ownerId', 'title', 'category', 'content']) &&
+               data.keys().hasOnly([
+                 'id',
+                 'ownerId',
+                 'title',
+                 'subtitle',
+                 'category',
+                 'tone',
+                 'length',
+                 'sections',
+                 'content',
+                 'createdAt',
+                 'updatedAt',
+                 'migratedFromGuestId',
+                 'migratedAt'
+               ]) &&
+               data.id is string && data.id == documentId && data.id.size() <= 128 &&
+               data.ownerId is string && data.ownerId == request.auth.uid && data.ownerId.size() <= 128 &&
+               data.title is string && data.title.size() > 0 && data.title.size() <= 256 &&
+               (!('subtitle' in data) || (data.subtitle is string && data.subtitle.size() <= 512)) &&
+               data.category is string && data.category.size() <= 64 &&
+               (!('tone' in data) || (data.tone is string && data.tone.size() <= 64)) &&
+               (!('length' in data) || (data.length is string && data.length.size() <= 64)) &&
+               (!('sections' in data) || (data.sections is list && data.sections.size() <= 100)) &&
+               data.content is string && data.content.size() <= 100000 &&
+               (!('createdAt' in data) || (data.createdAt is string && data.createdAt.size() <= 64)) &&
+               (!('updatedAt' in data) || (data.updatedAt is string && data.updatedAt.size() <= 64)) &&
+               (!('migratedFromGuestId' in data) || (data.migratedFromGuestId is string && data.migratedFromGuestId.size() <= 128)) &&
+               (!('migratedAt' in data) || (data.migratedAt is string && data.migratedAt.size() <= 64));
+      }
+
+      allow get: if isSignedIn() && isValidId(documentId) && resource != null && resource.data.ownerId == request.auth.uid;
+      allow list: if isSignedIn() && resource.data.ownerId == request.auth.uid;
+      allow create: if isSignedIn() && isValidId(documentId) && isValidDocument(request.resource.data);
+      allow update: if isSignedIn() &&
+                       isValidId(documentId) &&
+                       isValidDocument(request.resource.data) &&
+                       resource.data.ownerId == request.auth.uid &&
+                       request.resource.data.ownerId == resource.data.ownerId &&
+                       request.resource.data.id == resource.data.id &&
+                       request.resource.data.id == documentId &&
+                       (!('createdAt' in resource.data) || request.resource.data.createdAt == resource.data.createdAt);
+      allow delete: if isSignedIn() && isValidId(documentId) && resource.data.ownerId == request.auth.uid;
+    }
+
+    // --- Datasets Collection ---
+    match /datasets/{datasetId} {
+      function isValidDataset(data) {
+        return data.keys().hasAll(['id', 'ownerId', 'filename', 'format', 'rowCount', 'columnCount']) &&
+               data.keys().hasOnly([
+                 'id',
+                 'ownerId',
+                 'filename',
+                 'format',
+                 'rowCount',
+                 'columnCount',
+                 'columns',
+                 'previewData',
+                 'metadata',
+                 'cleanedVersionsCount',
+                 'createdAt',
+                 'updatedAt',
+                 'migratedFromGuestId',
+                 'migratedAt'
+               ]) &&
+               data.id is string && data.id == datasetId && data.id.size() <= 128 &&
+               data.ownerId is string && data.ownerId == request.auth.uid && data.ownerId.size() <= 128 &&
+               data.filename is string && data.filename.size() > 0 && data.filename.size() <= 256 &&
+               data.format is string && data.format.size() <= 32 &&
+               data.rowCount is int && data.rowCount >= 0 &&
+               data.columnCount is int && data.columnCount >= 0 &&
+               (!('columns' in data) || (data.columns is list && data.columns.size() <= 200)) &&
+               (!('previewData' in data) || (data.previewData is list && data.previewData.size() <= 100)) &&
+               (!('metadata' in data) || data.metadata is map) &&
+               (!('cleanedVersionsCount' in data) || (data.cleanedVersionsCount is int && data.cleanedVersionsCount >= 0)) &&
+               (!('createdAt' in data) || (data.createdAt is string && data.createdAt.size() <= 64)) &&
+               (!('updatedAt' in data) || (data.updatedAt is string && data.updatedAt.size() <= 64)) &&
+               (!('migratedFromGuestId' in data) || (data.migratedFromGuestId is string && data.migratedFromGuestId.size() <= 128)) &&
+               (!('migratedAt' in data) || (data.migratedAt is string && data.migratedAt.size() <= 64));
+      }
+
+      allow get: if isSignedIn() && isValidId(datasetId) && resource != null && resource.data.ownerId == request.auth.uid;
+      allow list: if isSignedIn() && resource.data.ownerId == request.auth.uid;
+      allow create: if isSignedIn() && isValidId(datasetId) && isValidDataset(request.resource.data);
+      allow update: if isSignedIn() &&
+                       isValidId(datasetId) &&
+                       isValidDataset(request.resource.data) &&
+                       resource.data.ownerId == request.auth.uid &&
+                       request.resource.data.ownerId == resource.data.ownerId &&
+                       request.resource.data.id == resource.data.id &&
+                       request.resource.data.id == datasetId &&
+                       (!('createdAt' in resource.data) || request.resource.data.createdAt == resource.data.createdAt);
+      allow delete: if isSignedIn() && isValidId(datasetId) && resource.data.ownerId == request.auth.uid;
+    }
+
+    // --- Cleaning Jobs Collection ---
+    match /cleaningJobs/{jobId} {
+      function isValidCleaningJob(data) {
+        return data.keys().hasAll(['id', 'ownerId', 'datasetId', 'operations', 'stats']) &&
+               data.keys().hasOnly([
+                 'id',
+                 'ownerId',
+                 'datasetId',
+                 'operations',
+                 'stats',
+                 'createdAt',
+                 'updatedAt'
+               ]) &&
+               data.id is string && data.id == jobId && data.id.size() <= 128 &&
+               data.ownerId is string && data.ownerId == request.auth.uid && data.ownerId.size() <= 128 &&
+               data.datasetId is string && data.datasetId.size() <= 128 &&
+               data.operations is list && data.operations.size() <= 50 &&
+               data.stats is map &&
+               (!('createdAt' in data) || (data.createdAt is string && data.createdAt.size() <= 64)) &&
+               (!('updatedAt' in data) || (data.updatedAt is string && data.updatedAt.size() <= 64));
+      }
+
+      allow get: if isSignedIn() && isValidId(jobId) && resource != null && resource.data.ownerId == request.auth.uid;
+      allow list: if isSignedIn() && resource.data.ownerId == request.auth.uid;
+      allow create: if isSignedIn() && isValidId(jobId) && isValidCleaningJob(request.resource.data);
+      allow update: if isSignedIn() &&
+                       isValidId(jobId) &&
+                       isValidCleaningJob(request.resource.data) &&
+                       resource.data.ownerId == request.auth.uid &&
+                       request.resource.data.ownerId == resource.data.ownerId &&
+                       request.resource.data.id == resource.data.id &&
+                       request.resource.data.id == jobId;
+      allow delete: if isSignedIn() && isValidId(jobId) && resource.data.ownerId == request.auth.uid;
+    }
+
+    // --- Activity Logs Collection ---
+    match /activityLogs/{logId} {
+      function isValidActivityLog(data) {
+        return data.keys().hasAll(['id', 'ownerId', 'activityType', 'description']) &&
+               data.keys().hasOnly([
+                 'id',
+                 'ownerId',
+                 'activityType',
+                 'description',
+                 'targetId',
+                 'targetType',
+                 'createdAt',
+                 'migratedFromGuestId',
+                 'migratedAt'
+               ]) &&
+               data.id is string && data.id == logId && data.id.size() <= 128 &&
+               data.ownerId is string && data.ownerId == request.auth.uid && data.ownerId.size() <= 128 &&
+               data.activityType is string && data.activityType.size() <= 64 &&
+               data.description is string && data.description.size() <= 1024 &&
+               (!('targetId' in data) || (data.targetId is string && data.targetId.size() <= 128)) &&
+               (!('targetType' in data) || (data.targetType is string && data.targetType.size() <= 64)) &&
+               (!('createdAt' in data) || (data.createdAt is string && data.createdAt.size() <= 64)) &&
+               (!('migratedFromGuestId' in data) || (data.migratedFromGuestId is string && data.migratedFromGuestId.size() <= 128)) &&
+               (!('migratedAt' in data) || (data.migratedAt is string && data.migratedAt.size() <= 64));
+      }
+
+      allow get: if isSignedIn() && isValidId(logId) && resource != null && resource.data.ownerId == request.auth.uid;
+      allow list: if isSignedIn() && resource.data.ownerId == request.auth.uid;
+      allow create: if isSignedIn() && isValidId(logId) && isValidActivityLog(request.resource.data);
+      allow update: if false; // Logs are immutable
+      allow delete: if isSignedIn() && isValidId(logId) && resource.data.ownerId == request.auth.uid;
+    }
+  }
+}

@@ -1,0 +1,217 @@
+{
+  "entities": {
+    "UserProfile": {
+      "title": "UserProfile",
+      "description": "User profile metadata and onboarding preferences",
+      "type": "object",
+      "properties": {
+        "uid": { "type": "string", "maxLength": 128 },
+        "email": { "type": "string", "maxLength": 256 },
+        "displayName": { "type": "string", "maxLength": 128 },
+        "photoURL": { "type": "string", "maxLength": 512 },
+        "tourCompleted": { "type": "boolean" },
+        "tourSkipped": { "type": "boolean" },
+        "tourUpdatedAt": { "type": "string", "format": "date-time" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["uid", "email"]
+    },
+    "CodeProject": {
+      "title": "CodeProject",
+      "description": "Multi-file programming project",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 128 },
+        "ownerId": { "type": "string", "maxLength": 128 },
+        "name": { "type": "string", "maxLength": 128 },
+        "language": { "type": "string", "maxLength": 64 },
+        "framework": { "type": "string", "maxLength": 64 },
+        "database": { "type": "string", "maxLength": 64 },
+        "description": { "type": "string", "maxLength": 4096 },
+        "requirements": { "type": "string", "maxLength": 8192 },
+        "architectureOverview": { "type": "string", "maxLength": 8192 },
+        "runInstructions": { "type": "string", "maxLength": 4096 },
+        "files": { "type": "array" },
+        "versions": { "type": "array" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" },
+        "migratedFromGuestId": { "type": "string", "maxLength": 128 },
+        "migratedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "ownerId", "name", "language", "files"]
+    },
+    "WebsiteProject": {
+      "title": "WebsiteProject",
+      "description": "Multi-file website project with manifest",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 128 },
+        "ownerId": { "type": "string", "maxLength": 128 },
+        "name": { "type": "string", "maxLength": 128 },
+        "category": { "type": "string", "maxLength": 64 },
+        "technology": { "type": "string", "maxLength": 64 },
+        "designDirection": { "type": "string", "maxLength": 64 },
+        "description": { "type": "string", "maxLength": 4096 },
+        "requirements": { "type": "string", "maxLength": 8192 },
+        "summary": { "type": "string", "maxLength": 4096 },
+        "fileManifest": { "type": "array" },
+        "isPublished": { "type": "boolean" },
+        "publishedAt": { "type": "string", "format": "date-time" },
+        "publishedUrl": { "type": "string", "maxLength": 512 },
+        "publishedManifest": { "type": "array" },
+        "snapshotVersion": { "type": "integer" },
+        "isPublic": { "type": "boolean" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" },
+        "migratedFromGuestId": { "type": "string", "maxLength": 128 },
+        "migratedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "ownerId", "name", "category", "fileManifest"]
+    },
+    "PublishedWebsite": {
+      "title": "PublishedWebsite",
+      "description": "Immutable published website snapshot for standalone share links",
+      "type": "object",
+      "properties": {
+        "projectId": { "type": "string", "maxLength": 128 },
+        "ownerId": { "type": "string", "maxLength": 128 },
+        "name": { "type": "string", "maxLength": 128 },
+        "category": { "type": "string", "maxLength": 64 },
+        "framework": { "type": "string", "maxLength": 64 },
+        "technology": { "type": "string", "maxLength": 64 },
+        "designDirection": { "type": "string", "maxLength": 64 },
+        "description": { "type": "string", "maxLength": 4096 },
+        "summary": { "type": "string", "maxLength": 4096 },
+        "fileManifest": { "type": "array" },
+        "entryHtml": { "type": "string", "maxLength": 200000 },
+        "dependencies": { "type": "object" },
+        "compiledHtml": { "type": "string", "maxLength": 850000 },
+        "publishedAt": { "type": "string", "format": "date-time" },
+        "publishedUrl": { "type": "string", "maxLength": 512 },
+        "snapshotVersion": { "type": "integer" },
+        "isPublic": { "type": "boolean" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": [
+        "projectId",
+        "ownerId",
+        "name",
+        "fileManifest",
+        "compiledHtml",
+        "publishedAt",
+        "snapshotVersion",
+        "isPublic"
+      ]
+    },
+    "DocumentItem": {
+      "title": "DocumentItem",
+      "description": "Professional document item",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 128 },
+        "ownerId": { "type": "string", "maxLength": 128 },
+        "title": { "type": "string", "maxLength": 256 },
+        "subtitle": { "type": "string", "maxLength": 512 },
+        "category": { "type": "string", "maxLength": 64 },
+        "tone": { "type": "string", "maxLength": 64 },
+        "length": { "type": "string", "maxLength": 64 },
+        "sections": { "type": "array" },
+        "content": { "type": "string", "maxLength": 100000 },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" },
+        "migratedFromGuestId": { "type": "string", "maxLength": 128 },
+        "migratedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "ownerId", "title", "category", "content"]
+    },
+    "DatasetItem": {
+      "title": "DatasetItem",
+      "description": "Dataset inspection and preview metadata",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 128 },
+        "ownerId": { "type": "string", "maxLength": 128 },
+        "filename": { "type": "string", "maxLength": 256 },
+        "format": { "type": "string", "maxLength": 32 },
+        "rowCount": { "type": "integer" },
+        "columnCount": { "type": "integer" },
+        "columns": { "type": "array" },
+        "previewData": { "type": "array" },
+        "metadata": { "type": "object" },
+        "cleanedVersionsCount": { "type": "integer" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" },
+        "migratedFromGuestId": { "type": "string", "maxLength": 128 },
+        "migratedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "ownerId", "filename", "format", "rowCount", "columnCount"]
+    },
+    "CleaningJob": {
+      "title": "CleaningJob",
+      "description": "Cleaning operations record",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 128 },
+        "ownerId": { "type": "string", "maxLength": 128 },
+        "datasetId": { "type": "string", "maxLength": 128 },
+        "operations": { "type": "array" },
+        "stats": { "type": "object" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "ownerId", "datasetId", "operations", "stats"]
+    },
+    "ActivityLog": {
+      "title": "ActivityLog",
+      "description": "User activity audit stream",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 128 },
+        "ownerId": { "type": "string", "maxLength": 128 },
+        "activityType": { "type": "string", "maxLength": 64 },
+        "description": { "type": "string", "maxLength": 1024 },
+        "targetId": { "type": "string", "maxLength": 128 },
+        "targetType": { "type": "string", "maxLength": 64 },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "migratedFromGuestId": { "type": "string", "maxLength": 128 },
+        "migratedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "ownerId", "activityType", "description"]
+    }
+  },
+  "firestore": {
+    "/users/{userId}": {
+      "schema": { "$ref": "UserProfile" },
+      "description": "User profile collection"
+    },
+    "/codeProjects/{projectId}": {
+      "schema": { "$ref": "CodeProject" },
+      "description": "Generated code projects"
+    },
+    "/websiteProjects/{projectId}": {
+      "schema": { "$ref": "WebsiteProject" },
+      "description": "Generated website projects"
+    },
+    "/publishedWebsites/{projectId}": {
+      "schema": { "$ref": "PublishedWebsite" },
+      "description": "Durable published website preview snapshots"
+    },
+    "/documents/{documentId}": {
+      "schema": { "$ref": "DocumentItem" },
+      "description": "Generated professional documents"
+    },
+    "/datasets/{datasetId}": {
+      "schema": { "$ref": "DatasetItem" },
+      "description": "Uploaded and cleaned datasets"
+    },
+    "/cleaningJobs/{jobId}": {
+      "schema": { "$ref": "CleaningJob" },
+      "description": "Dataset cleaning executions"
+    },
+    "/activityLogs/{logId}": {
+      "schema": { "$ref": "ActivityLog" },
+      "description": "Activity stream"
+    }
+  }
+}

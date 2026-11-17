@@ -1,0 +1,6 @@
+{
+  "name": "AI Engineering Workspace",
+  "description": "One workspace. Four intelligent agents. Infinite possibilities. Generate code, create complete websites, produce professional documents, and clean datasets.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
