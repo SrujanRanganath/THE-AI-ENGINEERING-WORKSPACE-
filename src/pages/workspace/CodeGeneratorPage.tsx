@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { useSearchParams } from 'react-router-dom';
 import { useAuth } from '../../lib/authContext';
 import {
@@ -12,6 +12,13 @@ import {
 import { downloadProjectZip, downloadSingleFile, sanitizeArchivePath } from '../../utils/zipExport';
 import { DiffViewer, ModifiedFile } from '../../components/common/DiffViewer';
 import { ModalDialog, ConfirmModal } from '../../components/common/ModalPrimitives';
+import {
+  AgentExecutionMode,
+  generateDemoCodeModification,
+  generateDemoCodeProject,
+} from '../../utils/demoModeEngine';
+import { getAiRequestHeaders, parseAiFailure, ParsedAiErrorInfo } from '../../lib/aiClient';
+import { AgentModeBar, AiUnavailableBanner } from '../../components/common/AgentModeControls';
 import {
   Code2,
   Play,
@@ -208,9 +215,14 @@ export const CodeGeneratorPage: React.FC = () => {
   const [instructions, setInstructions] = useState('');
 
   // Project Execution State
+  const [executionMode, setExecutionMode] = useState<AgentExecutionMode>('live');
   const [isGenerating, setIsGenerating] = useState(false);
   const [generationError, setGenerationError] = useState<string | null>(null);
+  const [aiUnavailableError, setAiUnavailableError] = useState<ParsedAiErrorInfo | null>(null);
   const [statusBanner, setStatusBanner] = useState<string | null>(null);
+  const submittingRef = useRef(false);
+  const modifyingRef = useRef(false);
+  const lastFailedActionRef = useRef<'generate' | 'modify'>('generate');
 
   // Active Project Data
   const [currentProject, setCurrentProject] = useState<CodeProjectRecord | null>(null);
@@ -382,22 +394,120 @@ export const CodeGeneratorPage: React.FC = () => {
     }
   };
 
-  // Handle Code Generation via AI Endpoint
-  const handleGenerate = async (e: React.FormEvent) => {
-    e.preventDefault();
+  const persistGeneratedCodeProject = async (
+    generatedData: {
+      architectureOverview?: string;
+      runInstructions?: string;
+      files: Array<{ path: string; content: string; language?: string }>;
+    },
+    bannerText: string
+  ) => {
+    const safeFiles = (generatedData.files || []).map((f: any) => ({
+      path: sanitizeArchivePath(f.path),
+      content: f.content,
+      language: f.language || language.toLowerCase(),
+    }));
+    const now = new Date().toISOString();
+    const newProjectId = `code_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`;
+
+    const newRecord: CodeProjectRecord = {
+      id: newProjectId,
+      ownerId: currentUser?.uid || 'guest_engineer_demo',
+      name: projectName.trim(),
+      language,
+      framework,
+      database,
+      description,
+      requirements,
+      architectureOverview: generatedData.architectureOverview,
+      runInstructions: generatedData.runInstructions,
+      files: safeFiles,
+      versions: [
+        {
+          id: 'v1',
+          timestamp: now,
+          note: 'Initial Project Generation',
+          files: safeFiles,
+        },
+      ],
+      createdAt: now,
+      updatedAt: now,
+    };
+
+    await saveCodeProject(newRecord);
+    if (currentUser?.uid) {
+      await logActivity(
+        currentUser.uid,
+        'code',
+        `Generated project '${projectName.trim()}' (${language}/${framework})`,
+        newProjectId,
+        'codeProject'
+      );
+    }
+
+    setCurrentProject(newRecord);
+    if (newRecord.files.length > 0) {
+      setSelectedFilePath(newRecord.files[0].path);
+      setEditedContent(newRecord.files[0].content);
+      setHasUnsavedEdits(false);
+    }
+    setStatusBanner(bannerText);
+  };
+
+  // Deterministic Offline Demo Generation (Zero AI API calls)
+  const runDemoGeneration = async () => {
+    if (submittingRef.current) return;
     if (!projectName.trim() || !description.trim()) {
       setGenerationError('Project name and description are required.');
       return;
     }
 
+    submittingRef.current = true;
     setGenerationError(null);
+    setAiUnavailableError(null);
     setStatusBanner(null);
     setIsGenerating(true);
 
     try {
+      const demo = generateDemoCodeProject({
+        projectName,
+        language,
+        framework,
+        database,
+        description,
+      });
+      await persistGeneratedCodeProject(
+        demo,
+        `[Demo Mode] Generated ${demo.files.length}-file ${demo.language} project "${demo.projectName}" locally (zero live AI calls).`
+      );
+    } catch (err: any) {
+      setGenerationError(err.message || 'Failed to generate Demo Mode code project.');
+    } finally {
+      submittingRef.current = false;
+      setIsGenerating(false);
+    }
+  };
+
+  // Live Gemini Generation
+  const runLiveGeneration = async () => {
+    if (submittingRef.current) return;
+    if (!projectName.trim() || !description.trim()) {
+      setGenerationError('Project name and description are required.');
+      return;
+    }
+
+    submittingRef.current = true;
+    lastFailedActionRef.current = 'generate';
+    setGenerationError(null);
+    setAiUnavailableError(null);
+    setStatusBanner(null);
+    setIsGenerating(true);
+
+    try {
+      const headers = await getAiRequestHeaders();
       const res = await fetch('/api/ai/generate-code', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers,
         body: JSON.stringify({
           projectName,
           language,
@@ -409,81 +519,76 @@ export const CodeGeneratorPage: React.FC = () => {
         }),
       });
 
-      const data = await res.json();
+      const data = await res.json().catch(() => null);
       if (!res.ok) {
-        throw new Error(data.error || 'Failed to generate code project.');
+        const parsedErr = parseAiFailure(res.status, data, 'Failed to generate code project.');
+        if (parsedErr.isQuotaOrTransient) {
+          setAiUnavailableError(parsedErr);
+          if (parsedErr.allModelsExhausted || parsedErr.recommendDemoMode) {
+            setExecutionMode('demo');
+          }
+        } else {
+          setGenerationError(parsedErr.message);
+        }
+        return;
       }
 
-      const generatedData = data.data;
-      const safeFiles = (generatedData.files || []).map((f: any) => ({
-        path: sanitizeArchivePath(f.path),
-        content: f.content,
-        language: f.language || language.toLowerCase(),
-      }));
-      const now = new Date().toISOString();
-      const newProjectId = `code_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`;
-
-      const newRecord: CodeProjectRecord = {
-        id: newProjectId,
-        ownerId: currentUser?.uid || 'guest_engineer_demo',
-        name: projectName,
-        language,
-        framework,
-        database,
-        description,
-        requirements,
-        architectureOverview: generatedData.architectureOverview,
-        runInstructions: generatedData.runInstructions,
-        files: safeFiles,
-        versions: [
-          {
-            id: 'v1',
-            timestamp: now,
-            note: 'Initial Project Generation',
-            files: safeFiles,
-          },
-        ],
-        createdAt: now,
-        updatedAt: now,
-      };
-
-      await saveCodeProject(newRecord);
-      if (currentUser?.uid) {
-        await logActivity(
-          currentUser.uid,
-          'code',
-          `Generated project '${projectName}' (${language}/${framework})`,
-          newProjectId,
-          'codeProject'
-        );
+      const generatedData = data?.data;
+      if (!generatedData || !Array.isArray(generatedData.files) || generatedData.files.length === 0) {
+        setGenerationError('AI returned an incomplete project payload. Please retry or switch to Demo Mode.');
+        return;
       }
 
-      setCurrentProject(newRecord);
-      if (newRecord.files.length > 0) {
-        setSelectedFilePath(newRecord.files[0].path);
-        setEditedContent(newRecord.files[0].content);
-        setHasUnsavedEdits(false);
-      }
+      const usedModel = data?.modelUsed || 'gemini-3-flash-preview';
+      const fallbackNote = data?.modelFallbackNotice ? ` (${data.modelFallbackNotice})` : '';
+      await persistGeneratedCodeProject(
+        generatedData,
+        `Generated ${generatedData.files.length}-file project "${projectName.trim()}" using ${usedModel}.${fallbackNote}`
+      );
     } catch (err: any) {
       console.error(err);
       setGenerationError(err.message || 'Error occurred while generating code.');
     } finally {
+      submittingRef.current = false;
       setIsGenerating(false);
     }
   };
 
-  // Handle Code Modification Request via AI
-  const handleRequestModification = async (e: React.FormEvent) => {
+  // Handle Code Generation Submit
+  const handleGenerate = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!modInstruction.trim() || !currentProject) return;
+    if (executionMode === 'demo') {
+      await runDemoGeneration();
+    } else {
+      await runLiveGeneration();
+    }
+  };
 
+  const runDemoModification = () => {
+    if (!currentProject) return;
+    setGenerationError(null);
+    setAiUnavailableError(null);
+    const demoDiff = generateDemoCodeModification({
+      instruction: modInstruction,
+      files: currentProject.files,
+    });
+    setDiffData(demoDiff);
+    setStatusBanner('[Demo Mode] Computed local code modification diff (zero live AI calls).');
+  };
+
+  const runLiveModification = async () => {
+    if (modifyingRef.current || !modInstruction.trim() || !currentProject) return;
+    modifyingRef.current = true;
+    lastFailedActionRef.current = 'modify';
     setIsModifying(true);
     setGenerationError(null);
+    setAiUnavailableError(null);
 
     try {
+      const headers = await getAiRequestHeaders();
       const res = await fetch('/api/ai/modify-code', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers,
         body: JSON.stringify({
           projectName: currentProject.name,
           instruction: modInstruction,
@@ -491,9 +596,18 @@ export const CodeGeneratorPage: React.FC = () => {
         }),
       });
 
-      const data = await res.json();
+      const data = await res.json().catch(() => null);
       if (!res.ok) {
-        throw new Error(data.error || 'Failed to modify code project.');
+        const parsedErr = parseAiFailure(res.status, data, 'Failed to modify code project.');
+        if (parsedErr.isQuotaOrTransient) {
+          setAiUnavailableError(parsedErr);
+          if (parsedErr.allModelsExhausted || parsedErr.recommendDemoMode) {
+            setExecutionMode('demo');
+          }
+        } else {
+          setGenerationError(parsedErr.message);
+        }
+        return;
       }
 
       setDiffData({
@@ -504,41 +618,33 @@ export const CodeGeneratorPage: React.FC = () => {
       console.error(err);
       setGenerationError(err.message || 'Modification request failed.');
     } finally {
+      modifyingRef.current = false;
       setIsModifying(false);
+    }
+  };
+
+  // Handle Code Modification Request
+  const handleRequestModification = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!modInstruction.trim() || !currentProject) return;
+    if (executionMode === 'demo') {
+      runDemoModification();
+    } else {
+      await runLiveModification();
     }
   };
 
   // Deterministic Modification Preview (Zero API Credits)
   const handleSimulateModificationPreview = () => {
     if (!currentProject) return;
-    const targetFile =
-      currentProject.files.find((f) => f.path.includes('index') || f.path.endsWith('.ts')) ||
-      currentProject.files[0];
-    if (!targetFile) return;
-
     const noteText =
-      modInstruction.trim() || 'Add request rate-limiting header and audit timestamp';
+      modInstruction.trim() || 'Add request rate-limiting helper and audit security header';
     setModInstruction(noteText);
-
-    setDiffData({
-      summary: `Proposed modification: ${noteText}`,
-      modifiedFiles: [
-        {
-          path: targetFile.path,
-          language: targetFile.language,
-          action: 'modified',
-          changeDescription: `Added audit security header constant for: ${noteText}`,
-          content: `${targetFile.content.trimEnd()}\n\n// Added by modification preview: ${noteText}\nexport const AUDIT_SECURITY_HEADER = 'X-Workspace-Verified';\n`,
-        },
-        {
-          path: 'src/utils/rateLimiter.ts',
-          language: 'typescript',
-          action: 'added',
-          changeDescription: 'Added rate-limiting helper utility module',
-          content: `export function checkRateLimit(clientKey: string, maxPerMin = 60): boolean {\n  return Boolean(clientKey) && maxPerMin > 0;\n}\n`,
-        },
-      ],
+    const demoDiff = generateDemoCodeModification({
+      instruction: noteText,
+      files: currentProject.files,
     });
+    setDiffData(demoDiff);
   };
 
   // Apply Changes from Diff Viewer
@@ -768,6 +874,42 @@ export const CodeGeneratorPage: React.FC = () => {
         )}
       </div>
 
+      <AgentModeBar
+        mode={executionMode}
+        onModeChange={(nextMode) => {
+          setExecutionMode(nextMode);
+          setAiUnavailableError(null);
+          setGenerationError(null);
+        }}
+        agentRole="synthesis"
+        disabled={isGenerating || isModifying}
+      />
+
+      {aiUnavailableError && (
+        <AiUnavailableBanner
+          errorInfo={aiUnavailableError}
+          isBusy={isGenerating || isModifying}
+          onRetryLive={() => {
+            if (lastFailedActionRef.current === 'modify') {
+              void runLiveModification();
+            } else {
+              void runLiveGeneration();
+            }
+          }}
+          onSwitchToDemoAndRun={() => {
+            setExecutionMode('demo');
+            setAiUnavailableError(null);
+            setGenerationError(null);
+            if (lastFailedActionRef.current === 'modify') {
+              runDemoModification();
+            } else {
+              void runDemoGeneration();
+            }
+          }}
+          onDismiss={() => setAiUnavailableError(null)}
+        />
+      )}
+
       {generationError && (
         <div
           role="alert"
@@ -898,6 +1040,7 @@ export const CodeGeneratorPage: React.FC = () => {
             <div className="space-y-2 pt-1">
               <button
                 type="submit"
+                data-testid="generate-code-button"
                 disabled={isGenerating}
                 className="w-full py-2.5 px-4 rounded-lg bg-violet-600 hover:bg-violet-500 text-white font-medium text-xs transition-all shadow-md shadow-violet-600/20 flex items-center justify-center gap-2 disabled:opacity-50"
               >
@@ -909,7 +1052,11 @@ export const CodeGeneratorPage: React.FC = () => {
                 ) : (
                   <>
                     <Wand2 size={15} />
-                    <span>Generate Code Project</span>
+                    <span>
+                      {executionMode === 'demo'
+                        ? 'Generate Code Project (Demo Mode)'
+                        : 'Generate Code Project'}
+                    </span>
                   </>
                 )}
               </button>

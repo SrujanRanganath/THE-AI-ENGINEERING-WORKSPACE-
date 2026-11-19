@@ -33,6 +33,12 @@ import {
   UnsavedChangesModal,
 } from '../../components/common/ModalPrimitives';
 import {
+  AgentExecutionMode,
+  generateDemoWebsiteProject,
+} from '../../utils/demoModeEngine';
+import { getAiRequestHeaders, parseAiFailure, ParsedAiErrorInfo } from '../../lib/aiClient';
+import { AgentModeBar, AiUnavailableBanner } from '../../components/common/AgentModeControls';
+import {
   Globe,
   Download,
   Copy,
@@ -105,11 +111,13 @@ export const WebsiteGeneratorPage: React.FC = () => {
   );
 
   // Generation & Status
+  const [executionMode, setExecutionMode] = useState<AgentExecutionMode>('live');
   const [isGenerating, setIsGenerating] = useState(false);
   const generatingRef = useRef(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  const [aiUnavailableError, setAiUnavailableError] = useState<ParsedAiErrorInfo | null>(null);
   const [statusBanner, setStatusBanner] = useState<string | null>(null);
-  const [lastModelUsed, setLastModelUsed] = useState<string>('gemini-4-hydrogen');
+  const [lastModelUsed, setLastModelUsed] = useState<string>('');
   const [lastRepairAttempts, setLastRepairAttempts] = useState<number>(0);
 
   // Active Project Data
@@ -345,11 +353,9 @@ export const WebsiteGeneratorPage: React.FC = () => {
     }
   };
 
-  // Handle Website Generation via AI Endpoint (Hydrogen primary model + repair pipeline)
-  const handleGenerate = async (e: React.FormEvent) => {
-    e.preventDefault();
+  // Deterministic Offline Demo Website Generation (Zero AI API calls)
+  const runDemoWebsiteGeneration = async () => {
     if (generatingRef.current) return;
-
     if (!websiteName.trim() || !description.trim()) {
       setErrorMessage('Website name and description are required.');
       return;
@@ -357,13 +363,97 @@ export const WebsiteGeneratorPage: React.FC = () => {
 
     generatingRef.current = true;
     setErrorMessage(null);
+    setAiUnavailableError(null);
     setStatusBanner(null);
     setIsGenerating(true);
 
     try {
+      const demo = generateDemoWebsiteProject({
+        websiteName,
+        category,
+        technology,
+        designDirection,
+        description,
+      });
+
+      const now = new Date().toISOString();
+      const newProjectId = `web_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`;
+
+      const newRecord: WebsiteProjectRecord = {
+        id: newProjectId,
+        ownerId: currentUser?.uid || 'guest_engineer_demo',
+        name: demo.websiteName,
+        category: demo.category,
+        technology: demo.technology,
+        designDirection: demo.designDirection,
+        description: description.trim(),
+        requirements,
+        summary: demo.summary,
+        fileManifest: demo.fileManifest,
+        createdAt: now,
+        updatedAt: now,
+      };
+
+      await saveWebsiteProject(newRecord);
+      if (currentUser?.uid) {
+        await logActivity(
+          currentUser.uid,
+          'website',
+          `[Demo Mode] Generated website '${demo.websiteName}' (${demo.category}/${demo.technology})`,
+          newProjectId,
+          'websiteProject'
+        );
+      }
+
+      setLastModelUsed('Demo Mode (Offline)');
+      setLastRepairAttempts(0);
+      setCurrentProject(newRecord);
+      setPublishedSnapshot(null);
+
+      if (newRecord.fileManifest.length > 0) {
+        const defaultFile =
+          newRecord.fileManifest.find(
+            (f) =>
+              f.path === 'src/App.jsx' ||
+              f.path === 'src/App.tsx' ||
+              f.path === 'index.html'
+          ) || newRecord.fileManifest[0];
+        setSelectedFilePath(defaultFile.path);
+        setEditedContent(defaultFile.content);
+        setHasUnsavedEdits(false);
+      }
+      setViewMode('preview');
+      setStatusBanner(
+        `[Demo Mode] Generated ${newRecord.fileManifest.length}-file ${demo.technology} website "${newRecord.name}" locally without live Gemini API calls.`
+      );
+    } catch (err: any) {
+      console.error(err);
+      setErrorMessage(err.message || 'Failed to generate Demo Mode website.');
+    } finally {
+      generatingRef.current = false;
+      setIsGenerating(false);
+    }
+  };
+
+  // Live Gemini Website Generation
+  const runLiveWebsiteGeneration = async () => {
+    if (generatingRef.current) return;
+    if (!websiteName.trim() || !description.trim()) {
+      setErrorMessage('Website name and description are required.');
+      return;
+    }
+
+    generatingRef.current = true;
+    setErrorMessage(null);
+    setAiUnavailableError(null);
+    setStatusBanner(null);
+    setIsGenerating(true);
+
+    try {
+      const headers = await getAiRequestHeaders();
       const res = await fetch('/api/ai/generate-website', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers,
         body: JSON.stringify({
           websiteName: websiteName.trim(),
           category,
@@ -382,7 +472,16 @@ export const WebsiteGeneratorPage: React.FC = () => {
             : res.status === 429
             ? 'Rate limit or quota reached (HTTP 429). Please wait a moment before trying again.'
             : 'Failed to generate website project. Please retry.';
-        throw new Error(data?.error || fallbackMsg);
+        const parsedErr = parseAiFailure(res.status, data, fallbackMsg);
+        if (parsedErr.isQuotaOrTransient) {
+          setAiUnavailableError(parsedErr);
+          if (parsedErr.allModelsExhausted || parsedErr.recommendDemoMode) {
+            setExecutionMode('demo');
+          }
+        } else {
+          setErrorMessage(parsedErr.message);
+        }
+        return;
       }
 
       if (!data || typeof data !== 'object') {
@@ -475,6 +574,16 @@ export const WebsiteGeneratorPage: React.FC = () => {
     } finally {
       generatingRef.current = false;
       setIsGenerating(false);
+    }
+  };
+
+  // Handle Website Generation Submit
+  const handleGenerate = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (executionMode === 'demo') {
+      await runDemoWebsiteGeneration();
+    } else {
+      await runLiveWebsiteGeneration();
     }
   };
 
@@ -838,7 +947,7 @@ export const WebsiteGeneratorPage: React.FC = () => {
             <Globe size={16} />
             <span>Agent 02 · Website Builder</span>
             <span className="px-2 py-0.5 rounded bg-violet-500/15 border border-violet-500/30 text-violet-300 font-mono text-[10px] normal-case">
-              Model: {lastModelUsed}
+              Model: {executionMode === 'demo' ? 'Demo Mode (Offline)' : lastModelUsed}
             </span>
           </div>
           <h2 className="text-xl sm:text-2xl font-bold text-white tracking-tight">
@@ -988,6 +1097,35 @@ export const WebsiteGeneratorPage: React.FC = () => {
         </div>
       )}
 
+      <AgentModeBar
+        mode={executionMode}
+        onModeChange={(nextMode) => {
+          setExecutionMode(nextMode);
+          setAiUnavailableError(null);
+          setErrorMessage(null);
+        }}
+        modelLabel={lastModelUsed || undefined}
+        agentRole="synthesis"
+        disabled={isGenerating}
+      />
+
+      {aiUnavailableError && (
+        <AiUnavailableBanner
+          errorInfo={aiUnavailableError}
+          isBusy={isGenerating}
+          onRetryLive={() => {
+            void runLiveWebsiteGeneration();
+          }}
+          onSwitchToDemoAndRun={() => {
+            setExecutionMode('demo');
+            setAiUnavailableError(null);
+            setErrorMessage(null);
+            void runDemoWebsiteGeneration();
+          }}
+          onDismiss={() => setAiUnavailableError(null)}
+        />
+      )}
+
       {errorMessage && (
         <div
           role="alert"
@@ -1128,6 +1266,7 @@ export const WebsiteGeneratorPage: React.FC = () => {
             <div className="space-y-2 pt-1">
               <button
                 type="submit"
+                data-testid="generate-website-button"
                 disabled={isGenerating}
                 className="w-full py-2.5 px-4 rounded-lg bg-violet-600 hover:bg-violet-500 text-white font-medium text-xs transition-all shadow-md shadow-violet-600/20 flex items-center justify-center gap-2 disabled:opacity-50"
               >
@@ -1139,7 +1278,11 @@ export const WebsiteGeneratorPage: React.FC = () => {
                 ) : (
                   <>
                     <Wand2 size={15} />
-                    <span>Generate Website</span>
+                    <span>
+                      {executionMode === 'demo'
+                        ? 'Generate Website (Demo Mode)'
+                        : 'Generate Website'}
+                    </span>
                   </>
                 )}
               </button>

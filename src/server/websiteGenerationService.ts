@@ -5,6 +5,16 @@ import {
   normalizeGeneratedSourceCode,
   validateJsxAndSyntax,
 } from '../utils/reactPreviewCompiler';
+import {
+  GeminiRequestError,
+  GeminiRequestManager,
+  getErrorStatusCode,
+  isTransientRetryableGeminiError,
+  normalizeGeminiError,
+  parseRetryAfterMs,
+} from './geminiRequestManager';
+
+export { getErrorStatusCode };
 
 /**
  * Verified official Gemini 4 model identifiers per @google/genai SDK specification:
@@ -698,14 +708,16 @@ export async function validateAndRepairWebsiteManifest(options: {
   }) => Promise<{ text?: string }>;
   maxRepairAttempts?: number;
   retryOptions?: RetryOptions;
+  requestManager?: GeminiRequestManager;
+  scopeKey?: string;
 }): Promise<{
   success: boolean;
   manifest: WebsiteManifestPayload;
   diagnostics: CompilationDiagnostic[];
   repairAttemptsUsed: number;
 }> {
-  const { manifest, model, generateContent, retryOptions } = options;
-  const maxRepairAttempts = Math.max(0, Math.min(3, options.maxRepairAttempts ?? 2));
+  const { manifest, model, generateContent, retryOptions, requestManager, scopeKey } = options;
+  const maxRepairAttempts = Math.max(0, Math.min(2, options.maxRepairAttempts ?? 1));
 
   let currentManifest = manifest;
   let compileResult = compileWebsitePreview(
@@ -797,19 +809,35 @@ ${fileEntry.content}
 \`\`\``;
 
       try {
-        const repairRes = await callWithBoundedRetry(
-          () =>
-            generateContent({
-              model,
-              contents: repairUserPrompt,
-              config: {
-                systemInstruction: repairSystemPrompt,
-                responseMimeType: 'application/json',
-                responseSchema: WEBSITE_FILE_REPAIR_SCHEMA,
-              },
-            }),
-          retryOptions
-        );
+        const repairRes = requestManager
+          ? (
+              await requestManager.execute({
+                agentType: 'website_repair',
+                scopeKey: scopeKey || 'guest:anon',
+                model,
+                contents: repairUserPrompt,
+                config: {
+                  systemInstruction: repairSystemPrompt,
+                  responseMimeType: 'application/json',
+                  responseSchema: WEBSITE_FILE_REPAIR_SCHEMA,
+                },
+                skipCache: true,
+                generateContent,
+              })
+            ).response
+          : await callWithBoundedRetry(
+              () =>
+                generateContent({
+                  model,
+                  contents: repairUserPrompt,
+                  config: {
+                    systemInstruction: repairSystemPrompt,
+                    responseMimeType: 'application/json',
+                    responseSchema: WEBSITE_FILE_REPAIR_SCHEMA,
+                  },
+                }),
+              retryOptions
+            );
 
         const parsedRepair = parseWebsiteGeneratorJson(repairRes.text);
         if (!parsedRepair.success || !parsedRepair.data || typeof parsedRepair.data !== 'object') {
@@ -862,12 +890,29 @@ ${fileEntry.content}
           compileResult = candidateCompile;
           anyFileImproved = true;
         }
-      } catch {
-        // If repair call fails, continue to report accurate original diagnostics
+      } catch (repairErr) {
+        const repairStatus = getErrorStatusCode(repairErr);
+        // Never keep firing additional repair calls on quota/429, 503, 403, or timeout
+        if (
+          repairStatus === 429 ||
+          repairStatus === 503 ||
+          repairStatus === 403 ||
+          (repairErr instanceof GeminiRequestError &&
+            (repairErr.code === 'QUOTA_EXHAUSTED' ||
+              repairErr.code === 'AI_TIMEOUT' ||
+              repairErr.code === 'MODEL_UNAVAILABLE'))
+        ) {
+          throw repairErr;
+        }
+        // Otherwise stop extra repair attempts cleanly and report original diagnostics
+      }
+      // Cap total AI repair calls per website generation to prevent quota burn
+      if (repairAttemptsUsed >= 2) {
+        break;
       }
     }
 
-    if (!anyFileImproved) {
+    if (!anyFileImproved || repairAttemptsUsed >= 2) {
       break;
     }
   }
@@ -880,49 +925,13 @@ ${fileEntry.content}
   };
 }
 
-export function getErrorStatusCode(error: unknown): number | undefined {
-  const err = error as any;
-  const rawStatus =
-    err?.status ?? err?.statusCode ?? err?.response?.status ?? err?.error?.code;
-  if (typeof rawStatus === 'number' && Number.isFinite(rawStatus)) {
-    return rawStatus;
-  }
-  const msg = err instanceof Error ? err.message : String(error || '');
-  if (/\b503\b|UNAVAILABLE|temporarily unavailable|overloaded/i.test(msg)) {
-    return 503;
-  }
-  if (/\b429\b|RESOURCE_EXHAUSTED|rate limit|quota/i.test(msg)) {
-    return 429;
-  }
-  if (/\b403\b|PERMISSION_DENIED/i.test(msg)) {
-    return 403;
-  }
-  if (/\b404\b|NOT_FOUND/i.test(msg)) {
-    return 404;
-  }
-  if (/\b400\b|INVALID_ARGUMENT|API_KEY_INVALID/i.test(msg)) {
-    return 400;
-  }
-  return undefined;
-}
-
 export function isRetryableGeminiError(error: unknown): boolean {
-  const status = getErrorStatusCode(error);
-  if (status === 503 || status === 429) {
-    return true;
-  }
-  if (status && status >= 400 && status < 500) {
-    return false;
-  }
-  const msg = error instanceof Error ? error.message : String(error || '');
-  return /ECONNRESET|ETIMEDOUT|EAI_AGAIN|socket hang up|fetch failed|UNAVAILABLE|temporarily unavailable|RESOURCE_EXHAUSTED/i.test(
-    msg
-  );
+  return isTransientRetryableGeminiError(error);
 }
 
 /**
  * Executes an async Gemini API call with bounded exponential backoff and jitter
- * for transient HTTP 503 / 429 failures.
+ * for transient HTTP 503 / network failures (HTTP 429 fails fast immediately).
  */
 export async function callWithBoundedRetry<T>(
   operation: () => Promise<T>,
@@ -945,9 +954,15 @@ export async function callWithBoundedRetry<T>(
       if (attempt >= maxRetries || !isRetryableGeminiError(err)) {
         throw err;
       }
+      const retryAfterMs = parseRetryAfterMs(err);
+      if (retryAfterMs && retryAfterMs > 10_000) {
+        throw err;
+      }
       const exponential = baseDelayMs * Math.pow(2, attempt);
       const jitter = Math.floor(random() * jitterMs);
-      const delay = Math.min(maxDelayMs, exponential + jitter);
+      const delay = retryAfterMs
+        ? Math.min(10_000, retryAfterMs)
+        : Math.min(maxDelayMs, exponential + jitter);
       await sleep(delay);
     }
   }
@@ -1016,6 +1031,8 @@ export async function executeWebsiteGeneration(options: {
   apiKeyConfigured: boolean;
   model?: string;
   fallbackModel?: string;
+  candidateModels?: string[];
+  useModelRouter?: boolean;
   generateContent: (params: {
     model: string;
     contents: string;
@@ -1027,15 +1044,23 @@ export async function executeWebsiteGeneration(options: {
   }) => Promise<{ text?: string }>;
   retryOptions?: RetryOptions;
   maxRepairAttempts?: number;
+  requestManager?: GeminiRequestManager;
+  scopeKey?: string;
+  skipCache?: boolean;
 }): Promise<WebsiteGenerationHttpResponse> {
   const {
     input,
     apiKeyConfigured,
     model = HYDROGEN_MODEL_ID,
     fallbackModel,
+    candidateModels,
+    useModelRouter = false,
     generateContent,
     retryOptions,
-    maxRepairAttempts = 2,
+    maxRepairAttempts = 1,
+    requestManager,
+    scopeKey = 'guest:anon',
+    skipCache = false,
   } = options;
 
   if (!input.websiteName?.trim() || !input.category?.trim() || !input.description?.trim()) {
@@ -1051,6 +1076,9 @@ export async function executeWebsiteGeneration(options: {
     return {
       status: 503,
       body: {
+        code: 'API_KEY_MISSING',
+        demoModeAvailable: true,
+        recommendDemoMode: true,
         error: 'Gemini API key is not configured on the server.',
       },
     };
@@ -1064,15 +1092,27 @@ export async function executeWebsiteGeneration(options: {
     designDirection,
   });
 
-  let activeModel = model;
-  let modelFallbackNotice: string | undefined;
-  let response: { text?: string };
-
-  try {
-    response = await callWithBoundedRetry(
+  const invokeModel = async (targetModel: string): Promise<{ text?: string }> => {
+    if (requestManager) {
+      const managed = await requestManager.execute({
+        agentType: 'website_generation',
+        scopeKey,
+        model: targetModel,
+        contents: userPrompt,
+        config: {
+          systemInstruction: systemPrompt,
+          responseMimeType: 'application/json',
+          responseSchema: WEBSITE_MANIFEST_RESPONSE_SCHEMA,
+        },
+        skipCache,
+        generateContent: generateContent as any,
+      });
+      return managed.response;
+    }
+    return callWithBoundedRetry(
       () =>
         generateContent({
-          model: activeModel,
+          model: targetModel,
           contents: userPrompt,
           config: {
             systemInstruction: systemPrompt,
@@ -1082,41 +1122,74 @@ export async function executeWebsiteGeneration(options: {
         }),
       retryOptions
     );
-  } catch (primaryError) {
-    const primaryStatus = getErrorStatusCode(primaryError);
+  };
 
-    // If a distinct server fallback model is configured and the primary model (e.g. Argon)
-    // is unavailable or restricted for the current key, attempt the verified fallback model
-    // while transparently reporting which model was used.
-    if (
-      fallbackModel &&
-      fallbackModel !== activeModel &&
-      (primaryStatus === 403 ||
-        primaryStatus === 404 ||
-        primaryStatus === 503 ||
-        primaryStatus === 429)
-    ) {
-      try {
-        activeModel = fallbackModel;
-        modelFallbackNotice = `Primary model '${model}' returned HTTP ${primaryStatus}; generated using configured fallback model '${fallbackModel}'.`;
-        response = await callWithBoundedRetry(
-          () =>
-            generateContent({
-              model: activeModel,
-              contents: userPrompt,
-              config: {
-                systemInstruction: systemPrompt,
-                responseMimeType: 'application/json',
-                responseSchema: WEBSITE_MANIFEST_RESPONSE_SCHEMA,
-              },
-            }),
-          retryOptions
-        );
-      } catch (fallbackError) {
-        return mapProviderErrorToHttpResponse(fallbackError, activeModel);
+  let activeModel = model;
+  let modelFallbackNotice: string | undefined;
+  let attemptedModels: string[] = [model];
+  let fallbackUsed = false;
+  let response: { text?: string };
+
+  if (requestManager && (useModelRouter || (candidateModels && candidateModels.length > 0))) {
+    try {
+      const routed = await requestManager.executeWithRouting({
+        agentType: 'website_generation',
+        scopeKey,
+        preferredModel: model,
+        candidateModels,
+        contents: userPrompt,
+        config: {
+          systemInstruction: systemPrompt,
+          responseMimeType: 'application/json',
+          responseSchema: WEBSITE_MANIFEST_RESPONSE_SCHEMA,
+        },
+        skipCache,
+        validateResponse: (rawText) => {
+          const parsed = parseWebsiteGeneratorJson(rawText);
+          if (!parsed.success) {
+            return { valid: false, reason: parsed.error };
+          }
+          const norm = validateAndNormalizeWebsiteManifest(parsed.data, {
+            websiteName: input.websiteName.trim(),
+            category: input.category.trim(),
+            technology,
+            designDirection,
+          });
+          return norm.valid ? { valid: true } : { valid: false, reason: norm.error };
+        },
+        generateContent: generateContent as any,
+      });
+      response = routed.response;
+      activeModel = routed.modelUsed;
+      attemptedModels = routed.attemptedModels || [activeModel];
+      fallbackUsed = Boolean(routed.fallbackUsed);
+      modelFallbackNotice = routed.modelFallbackNotice;
+    } catch (routerErr) {
+      return mapProviderErrorToHttpResponse(routerErr, activeModel);
+    }
+  } else {
+    try {
+      response = await invokeModel(activeModel);
+    } catch (primaryError) {
+      const primaryStatus = getErrorStatusCode(primaryError);
+
+      if (
+        fallbackModel &&
+        fallbackModel !== activeModel &&
+        (primaryStatus === 403 || primaryStatus === 404 || primaryStatus === 503)
+      ) {
+        try {
+          activeModel = fallbackModel;
+          attemptedModels = [model, fallbackModel];
+          fallbackUsed = true;
+          modelFallbackNotice = `Primary model '${model}' returned HTTP ${primaryStatus}; generated using configured fallback model '${fallbackModel}'.`;
+          response = await invokeModel(activeModel);
+        } catch (fallbackError) {
+          return mapProviderErrorToHttpResponse(fallbackError, activeModel);
+        }
+      } else {
+        return mapProviderErrorToHttpResponse(primaryError, activeModel);
       }
-    } else {
-      return mapProviderErrorToHttpResponse(primaryError, activeModel);
     }
   }
 
@@ -1127,6 +1200,8 @@ export async function executeWebsiteGeneration(options: {
       body: {
         code: parsedResult.code,
         modelUsed: activeModel,
+        attemptedModels,
+        demoModeAvailable: true,
         error: parsedResult.error,
       },
     };
@@ -1145,19 +1220,28 @@ export async function executeWebsiteGeneration(options: {
       body: {
         code: validated.code,
         modelUsed: activeModel,
+        attemptedModels,
+        demoModeAvailable: true,
         error: validated.error,
       },
     };
   }
 
-  // Final Source-Code Validation & Bounded Automatic Repair Gate (Requirements 3B, 3C, 3D)
-  const verification = await validateAndRepairWebsiteManifest({
-    manifest: validated.data,
-    model: activeModel,
-    generateContent,
-    maxRepairAttempts,
-    retryOptions,
-  });
+  // Final Source-Code Validation & Bounded Automatic Repair Gate (aborts cleanly on 429/503/timeout)
+  let verification;
+  try {
+    verification = await validateAndRepairWebsiteManifest({
+      manifest: validated.data,
+      model: activeModel,
+      generateContent: generateContent as any,
+      maxRepairAttempts,
+      retryOptions,
+      requestManager,
+      scopeKey,
+    });
+  } catch (repairErr) {
+    return mapProviderErrorToHttpResponse(repairErr, activeModel);
+  }
 
   if (!verification.success) {
     const firstDiag = verification.diagnostics[0];
@@ -1171,8 +1255,10 @@ export async function executeWebsiteGeneration(options: {
         success: false,
         code: 'SOURCE_COMPILATION_FAILED',
         modelUsed: activeModel,
+        attemptedModels,
         repairAttemptsUsed: verification.repairAttemptsUsed,
         diagnostics: verification.diagnostics,
+        demoModeAvailable: true,
         error: `Generated website source failed validation after ${verification.repairAttemptsUsed} repair attempt(s) — ${locationStr}`,
       },
     };
@@ -1185,6 +1271,8 @@ export async function executeWebsiteGeneration(options: {
       requestId: `req_web_${Date.now()}`,
       modelUsed: activeModel,
       requestedModel: model,
+      attemptedModels,
+      fallbackUsed,
       ...(modelFallbackNotice ? { modelFallbackNotice } : {}),
       repairAttemptsUsed: verification.repairAttemptsUsed,
       data: verification.manifest,
@@ -1196,46 +1284,27 @@ function mapProviderErrorToHttpResponse(
   error: unknown,
   attemptedModel: string
 ): WebsiteGenerationHttpResponse {
-  const status = getErrorStatusCode(error);
-  if (status === 503) {
-    return {
-      status: 503,
-      body: {
-        code: 'MODEL_UNAVAILABLE',
-        modelAttempted: attemptedModel,
-        error:
-          'The Gemini model is temporarily unavailable (HTTP 503). Please wait a moment and try again.',
-      },
-    };
-  }
-  if (status === 429) {
-    return {
-      status: 429,
-      body: {
-        code: 'RATE_LIMITED',
-        modelAttempted: attemptedModel,
-        error:
-          'Gemini quota or rate limit exceeded (HTTP 429). Please wait a moment before trying again.',
-      },
-    };
-  }
-  if (status === 403 || status === 400 || status === 404) {
-    return {
-      status,
-      body: {
-        modelAttempted: attemptedModel,
-        error:
-          error instanceof Error && error.message
-            ? error.message
-            : `Website generation request with model '${attemptedModel}' was rejected by the Gemini API.`,
-      },
-    };
-  }
+  const normalized = normalizeGeminiError(error);
+  const attemptedModels =
+    error instanceof GeminiRequestError && error.attemptedModels
+      ? error.attemptedModels
+      : [attemptedModel];
+  const allModelsExhausted =
+    error instanceof GeminiRequestError ? Boolean(error.allModelsExhausted) : false;
+  const recommendDemoMode =
+    error instanceof GeminiRequestError ? Boolean(error.recommendDemoMode) : false;
+
   return {
-    status: 500,
+    status: normalized.status,
     body: {
+      code: normalized.code,
       modelAttempted: attemptedModel,
-      error: 'Failed to generate website due to an unexpected server error. Please try again.',
+      attemptedModels,
+      ...(allModelsExhausted ? { allModelsExhausted: true } : {}),
+      ...(recommendDemoMode ? { recommendDemoMode: true } : {}),
+      demoModeAvailable: true,
+      ...(normalized.retryAfterSeconds ? { retryAfterSeconds: normalized.retryAfterSeconds } : {}),
+      error: normalized.message,
     },
   };
 }

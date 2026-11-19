@@ -46,13 +46,51 @@ export interface FirestoreErrorInfo {
   };
 }
 
+export function toSafeUserFirestoreErrorMessage(
+  error: unknown,
+  fallbackMessage = 'Operation could not be saved. Please retry.'
+): string {
+  const safeFallback =
+    typeof fallbackMessage === 'string' && fallbackMessage.trim()
+      ? fallbackMessage.trim()
+      : 'Operation could not be saved. Please retry.';
+  if (!error) return safeFallback;
+
+  const rawMsg = error instanceof Error ? error.message : String(error);
+  const lower = rawMsg.toLowerCase();
+
+  // Never expose raw JSON error blobs, authInfo, userId, email, providerInfo, or internal paths
+  if (
+    rawMsg.trim().startsWith('{') ||
+    lower.includes('authinfo') ||
+    lower.includes('providerinfo') ||
+    lower.includes('function setdoc()') ||
+    lower.includes('function updatedoc()') ||
+    lower.includes('firebaseerror') ||
+    lower.includes('firestore') ||
+    lower.includes('nested arrays are not supported') ||
+    lower.includes('permission-denied') ||
+    lower.includes('missing or insufficient permissions') ||
+    /\b(?:codeProjects|websiteProjects|documents|datasets|cleaningJobs|activityLogs|publishedWebsites)\/[A-Za-z0-9_-]+/.test(
+      rawMsg
+    ) ||
+    /[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/.test(rawMsg)
+  ) {
+    return safeFallback;
+  }
+
+  return safeFallback;
+}
+
 export function handleFirestoreError(
   error: unknown,
   operationType: OperationType,
-  path: string | null
+  path: string | null,
+  safeUserMessage?: string
 ): never {
+  const rawMessage = error instanceof Error ? error.message : String(error);
   const errInfo: FirestoreErrorInfo = {
-    error: error instanceof Error ? error.message : String(error),
+    error: rawMessage,
     authInfo: {
       userId: auth.currentUser?.uid,
       email: auth.currentUser?.email,
@@ -68,8 +106,116 @@ export function handleFirestoreError(
     operationType,
     path,
   };
-  console.error('Firestore Error:', JSON.stringify(errInfo));
-  throw new Error(JSON.stringify(errInfo));
+  // Log minimal internal diagnostics without throwing PII or internal paths to UI callers
+  console.warn(`Firestore ${operationType} error:`, rawMessage);
+  const defaultSafeMessage =
+    operationType === OperationType.DELETE
+      ? 'Unable to delete item right now. Please retry.'
+      : operationType === OperationType.LIST || operationType === OperationType.GET
+      ? 'Unable to load workspace items right now. Please retry.'
+      : 'Unable to save changes right now. Please retry.';
+  const thrown = new Error(safeUserMessage || defaultSafeMessage) as Error & {
+    firestoreErrorInfo?: FirestoreErrorInfo;
+  };
+  Object.defineProperty(thrown, 'firestoreErrorInfo', {
+    value: errInfo,
+    enumerable: false,
+    writable: false,
+  });
+  throw thrown;
+}
+
+/**
+ * Checks whether a payload contains any nested arrays (`Array` directly containing another `Array`),
+ * which Cloud Firestore rejects with `Nested arrays are not supported`.
+ */
+export function containsNestedArray(value: unknown): boolean {
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      if (Array.isArray(item) || containsNestedArray(item)) {
+        return true;
+      }
+    }
+    return false;
+  }
+  if (value && typeof value === 'object') {
+    for (const val of Object.values(value as Record<string, unknown>)) {
+      if (containsNestedArray(val)) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+/**
+ * Checks whether an object graph contains any `undefined` property values,
+ * which Cloud Firestore rejects in `setDoc()` / `updateDoc()`.
+ */
+export function containsUndefinedValue(value: unknown): boolean {
+  if (value === undefined) return true;
+  if (Array.isArray(value)) {
+    return value.some((item) => containsUndefinedValue(item));
+  }
+  if (value && typeof value === 'object') {
+    for (const val of Object.values(value as Record<string, unknown>)) {
+      if (val === undefined || containsUndefinedValue(val)) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+/**
+ * Recursively normalizes any value into a Firestore-safe structure:
+ * - Strips keys with `undefined` values from objects (converts `undefined` inside arrays to `null`).
+ * - Converts 2D table row arrays (`rows: string[][]`) into `Array<{ cells: string[] }>`.
+ * - Converts any remaining direct nested arrays (`Array` inside `Array`) into `{ cells: [...] }`
+ *   when inside a `rows` property, or `{ items: [...] }` otherwise, guaranteeing zero nested arrays.
+ */
+export function sanitizeFirestoreValue<T = any>(value: T, parentKey?: string): T {
+  if (value === undefined) {
+    return null as unknown as T;
+  }
+  if (value === null || typeof value !== 'object') {
+    return value;
+  }
+  if (value instanceof Date) {
+    return value.toISOString() as unknown as T;
+  }
+  if (Array.isArray(value)) {
+    const sanitizedElements = value.map((item) => {
+      if (Array.isArray(item)) {
+        // Firestore forbids nested arrays (Array directly inside Array).
+        // Wrap inner array in an object `{ cells: [...] }` for table rows or `{ items: [...] }` generally.
+        const flatInner = sanitizeFirestoreValue(item, parentKey);
+        if (parentKey === 'rows') {
+          return {
+            cells: Array.isArray(flatInner)
+              ? flatInner.map((cell) =>
+                  cell !== null && typeof cell === 'object' ? JSON.stringify(cell) : String(cell ?? '')
+                )
+              : [String(flatInner ?? '')],
+          };
+        }
+        return {
+          items: Array.isArray(flatInner) ? flatInner : [flatInner],
+        };
+      }
+      return sanitizeFirestoreValue(item, parentKey);
+    });
+    return sanitizedElements as unknown as T;
+  }
+
+  const result: Record<string, any> = {};
+  for (const [key, val] of Object.entries(value as Record<string, any>)) {
+    if (val === undefined) {
+      continue;
+    }
+    result[key] = sanitizeFirestoreValue(val, key);
+  }
+  return result as T;
 }
 
 function isFirestoreOfflineError(error: unknown): boolean {
@@ -173,7 +319,7 @@ export async function migrateGuestWorkspaceData(
     persistTargetRecord: async (col: WorkspaceCollectionName, record: OwnedWorkspaceRecord) => {
       if (canSyncWithCloudFirestore(targetUid)) {
         const docRef = doc(db, col, record.id);
-        await setDoc(docRef, record);
+        await setDoc(docRef, sanitizeFirestoreValue(record));
       }
     },
   });
@@ -205,7 +351,7 @@ export interface CodeProjectRecord {
 }
 
 function clampCodeProject(project: CodeProjectRecord): CodeProjectRecord {
-  return {
+  return sanitizeFirestoreValue({
     ...project,
     name: String(project.name || 'Untitled Project').slice(0, 128),
     language: String(project.language || 'TypeScript').slice(0, 64),
@@ -221,7 +367,7 @@ function clampCodeProject(project: CodeProjectRecord): CodeProjectRecord {
       : undefined,
     files: Array.isArray(project.files) ? project.files.slice(0, 100) : [],
     versions: Array.isArray(project.versions) ? project.versions.slice(-50) : undefined,
-  };
+  });
 }
 
 export async function saveCodeProject(project: CodeProjectRecord): Promise<void> {
@@ -266,7 +412,7 @@ export async function updateCodeProject(
 ): Promise<void> {
   const colPath = 'codeProjects';
   const ownerId = auth.currentUser?.uid || 'guest_engineer_demo';
-  const safeUpdates: Partial<CodeProjectRecord> = { ...updates };
+  const safeUpdates: Partial<CodeProjectRecord> = sanitizeFirestoreValue({ ...updates });
   if (typeof safeUpdates.name === 'string') safeUpdates.name = safeUpdates.name.slice(0, 128);
   if (typeof safeUpdates.description === 'string') {
     safeUpdates.description = safeUpdates.description.slice(0, 4096);
@@ -354,15 +500,16 @@ export interface WebsiteProjectRecord {
 
 export async function saveWebsiteProject(project: WebsiteProjectRecord): Promise<void> {
   const colPath = 'websiteProjects';
-  upsertLocalItem(colPath, project.ownerId, project);
-  if (!canSyncWithCloudFirestore(project.ownerId)) {
+  const sanitized = sanitizeFirestoreValue(project);
+  upsertLocalItem(colPath, sanitized.ownerId, sanitized);
+  if (!canSyncWithCloudFirestore(sanitized.ownerId)) {
     return;
   }
   try {
-    const docRef = doc(db, colPath, project.id);
-    await setDoc(docRef, project);
+    const docRef = doc(db, colPath, sanitized.id);
+    await setDoc(docRef, sanitized);
   } catch (err) {
-    handleFirestoreError(err, OperationType.WRITE, `${colPath}/${project.id}`);
+    handleFirestoreError(err, OperationType.WRITE, `${colPath}/${sanitized.id}`);
   }
 }
 
@@ -394,7 +541,8 @@ export async function updateWebsiteProject(
 ): Promise<void> {
   const colPath = 'websiteProjects';
   const ownerId = explicitOwnerId || auth.currentUser?.uid || 'guest_engineer_demo';
-  updateLocalItemById<WebsiteProjectRecord>(colPath, ownerId, projectId, updates);
+  const safeUpdates = sanitizeFirestoreValue(updates);
+  updateLocalItemById<WebsiteProjectRecord>(colPath, ownerId, projectId, safeUpdates);
   if (!canSyncWithCloudFirestore(ownerId)) {
     return;
   }
@@ -406,13 +554,13 @@ export async function updateWebsiteProject(
     );
     await setDoc(
       docRef,
-      {
+      sanitizeFirestoreValue({
         ...(localMatch || {}),
-        ...updates,
+        ...safeUpdates,
         id: projectId,
         ownerId,
         updatedAt: new Date().toISOString(),
-      },
+      }),
       { merge: true }
     );
   } catch (err) {
@@ -667,25 +815,109 @@ export interface DocumentRecord {
   content: string;
   createdAt: string;
   updatedAt: string;
+  migratedFromGuestId?: string;
+  migratedAt?: string;
 }
 
-function clampDocument(docItem: DocumentRecord): DocumentRecord {
+/**
+ * Recursively restores Firestore-compatible table row wrappers (`{ cells: string[] }`)
+ * or array wrappers (`{ items: any[] }`) inside document sections back to standard arrays (`string[][]`).
+ */
+export function denormalizeDocumentSectionValue<T = any>(value: T, parentKey?: string): T {
+  if (value === null || value === undefined || typeof value !== 'object') {
+    return value;
+  }
+  if (Array.isArray(value)) {
+    if (parentKey === 'rows') {
+      return value.map((row) => {
+        if (Array.isArray(row)) {
+          return row.map((c) => String(c ?? ''));
+        }
+        if (row && typeof row === 'object' && Array.isArray((row as any).cells)) {
+          return (row as any).cells.map((c: unknown) => String(c ?? ''));
+        }
+        if (row && typeof row === 'object' && Array.isArray((row as any).items)) {
+          return (row as any).items.map((c: unknown) => String(c ?? ''));
+        }
+        return [String(row ?? '')];
+      }) as unknown as T;
+    }
+
+    return value.map((item) => {
+      if (
+        item &&
+        typeof item === 'object' &&
+        !Array.isArray(item) &&
+        Object.keys(item).length === 1 &&
+        Array.isArray((item as any).items)
+      ) {
+        return denormalizeDocumentSectionValue((item as any).items, parentKey);
+      }
+      return denormalizeDocumentSectionValue(item, parentKey);
+    }) as unknown as T;
+  }
+
+  const out: Record<string, any> = {};
+  for (const [k, v] of Object.entries(value as Record<string, any>)) {
+    out[k] = denormalizeDocumentSectionValue(v, k);
+  }
+  return out as T;
+}
+
+export function denormalizeDocumentFromFirestore(docItem: DocumentRecord): DocumentRecord {
   return {
     ...docItem,
+    sections: Array.isArray(docItem.sections)
+      ? denormalizeDocumentSectionValue(docItem.sections, 'sections')
+      : [],
+  };
+}
+
+/**
+ * Normalizes a DocumentRecord into a strict Firestore-compatible payload:
+ * - Enforces field allowlist matching `firestore.rules` for `/documents/{documentId}`.
+ * - Converts any nested arrays inside `sections` (such as `table.rows: string[][]`,
+ *   `tables[].rows: string[][]`, `subsections[].table.rows: string[][]`, or `blocks[].table.rows: string[][]`)
+ *   into Firestore-supported array-of-objects (`Array<{ cells: string[] }>`).
+ * - Strips any `undefined` properties so `setDoc()` and `updateDoc()` never fail.
+ */
+export function normalizeDocumentForFirestore(docItem: DocumentRecord): DocumentRecord {
+  const rawSections = Array.isArray(docItem.sections) ? docItem.sections.slice(0, 100) : [];
+  const sanitizedSections = sanitizeFirestoreValue(rawSections, 'sections');
+
+  const payload: DocumentRecord = {
+    id: String(docItem.id || '').slice(0, 128),
+    ownerId: String(docItem.ownerId || '').slice(0, 128),
     title: String(docItem.title || 'Untitled Document').slice(0, 256),
-    subtitle: docItem.subtitle ? String(docItem.subtitle).slice(0, 512) : undefined,
+    ...(docItem.subtitle !== undefined && docItem.subtitle !== null && String(docItem.subtitle).length > 0
+      ? { subtitle: String(docItem.subtitle).slice(0, 512) }
+      : {}),
     category: String(docItem.category || 'Technical').slice(0, 64),
     tone: String(docItem.tone || 'Professional').slice(0, 64),
     length: String(docItem.length || 'Standard').slice(0, 64),
-    sections: Array.isArray(docItem.sections) ? docItem.sections.slice(0, 100) : [],
+    sections: sanitizedSections,
     content: String(docItem.content || '').slice(0, 100000),
+    createdAt: String(docItem.createdAt || new Date().toISOString()).slice(0, 64),
+    updatedAt: String(docItem.updatedAt || new Date().toISOString()).slice(0, 64),
+    ...(typeof docItem.migratedFromGuestId === 'string' && docItem.migratedFromGuestId
+      ? { migratedFromGuestId: docItem.migratedFromGuestId.slice(0, 128) }
+      : {}),
+    ...(typeof docItem.migratedAt === 'string' && docItem.migratedAt
+      ? { migratedAt: docItem.migratedAt.slice(0, 64) }
+      : {}),
   };
+
+  return sanitizeFirestoreValue(payload);
+}
+
+function clampDocument(docItem: DocumentRecord): DocumentRecord {
+  return normalizeDocumentForFirestore(docItem);
 }
 
 export async function saveDocument(docItem: DocumentRecord): Promise<void> {
   const colPath = 'documents';
   const normalized = clampDocument(docItem);
-  upsertLocalItem(colPath, normalized.ownerId, normalized);
+  upsertLocalItem(colPath, normalized.ownerId, denormalizeDocumentFromFirestore(normalized));
   if (!canSyncWithCloudFirestore(normalized.ownerId)) {
     return;
   }
@@ -693,13 +925,20 @@ export async function saveDocument(docItem: DocumentRecord): Promise<void> {
     const docRef = doc(db, colPath, normalized.id);
     await setDoc(docRef, normalized);
   } catch (err) {
-    handleFirestoreError(err, OperationType.WRITE, `${colPath}/${normalized.id}`);
+    handleFirestoreError(
+      err,
+      OperationType.WRITE,
+      `${colPath}/${normalized.id}`,
+      'Document generated, but saving failed. Please retry.'
+    );
   }
 }
 
 export async function getDocuments(ownerId: string): Promise<DocumentRecord[]> {
   const colPath = 'documents';
-  const localItems = getLocalItems<DocumentRecord>(colPath, ownerId);
+  const localItems = getLocalItems<DocumentRecord>(colPath, ownerId).map((item) =>
+    denormalizeDocumentFromFirestore(item)
+  );
   if (!canSyncWithCloudFirestore(ownerId)) {
     return localItems;
   }
@@ -707,7 +946,9 @@ export async function getDocuments(ownerId: string): Promise<DocumentRecord[]> {
     const q = query(collection(db, colPath), where('ownerId', '==', ownerId));
     const snapshot = await getDocs(q);
     const results: DocumentRecord[] = [];
-    snapshot.forEach((d) => results.push(d.data() as DocumentRecord));
+    snapshot.forEach((d) =>
+      results.push(denormalizeDocumentFromFirestore(d.data() as DocumentRecord))
+    );
     return mergeById(results, localItems);
   } catch (err) {
     if (isFirestoreOfflineError(err)) {
@@ -732,10 +973,18 @@ export async function updateDocument(
   if (typeof safeUpdates.content === 'string') {
     safeUpdates.content = safeUpdates.content.slice(0, 100000);
   }
-  if (Array.isArray(safeUpdates.sections)) safeUpdates.sections = safeUpdates.sections.slice(0, 100);
+  if (Array.isArray(safeUpdates.sections)) {
+    safeUpdates.sections = sanitizeFirestoreValue(safeUpdates.sections.slice(0, 100), 'sections');
+  }
   delete safeUpdates.createdAt;
+  const sanitizedUpdates = sanitizeFirestoreValue(safeUpdates);
 
-  updateLocalItemById<DocumentRecord>(colPath, ownerId, docId, safeUpdates);
+  updateLocalItemById<DocumentRecord>(
+    colPath,
+    ownerId,
+    docId,
+    denormalizeDocumentSectionValue(sanitizedUpdates)
+  );
   if (!canSyncWithCloudFirestore(ownerId)) {
     return;
   }
@@ -743,7 +992,7 @@ export async function updateDocument(
   try {
     const docRef = doc(db, 'documents', docId);
     await updateDoc(docRef, {
-      ...safeUpdates,
+      ...sanitizedUpdates,
       updatedAt: new Date().toISOString(),
     });
   } catch (err: any) {
@@ -759,7 +1008,12 @@ export async function updateDocument(
         return;
       }
     }
-    handleFirestoreError(err, OperationType.UPDATE, path);
+    handleFirestoreError(
+      err,
+      OperationType.UPDATE,
+      path,
+      'Failed to save document updates. Please retry.'
+    );
   }
 }
 
@@ -775,7 +1029,12 @@ export async function deleteDocument(docId: string): Promise<void> {
     const docRef = doc(db, 'documents', docId);
     await deleteDoc(docRef);
   } catch (err) {
-    handleFirestoreError(err, OperationType.DELETE, path);
+    handleFirestoreError(
+      err,
+      OperationType.DELETE,
+      path,
+      'Failed to delete document. Please retry.'
+    );
   }
 }
 
@@ -797,19 +1056,44 @@ export interface DatasetRecord {
   updatedAt: string;
 }
 
+function boundPreviewRows(
+  rows: Record<string, any>[] | undefined,
+  columnsHint?: string[]
+): Record<string, any>[] {
+  if (!Array.isArray(rows) || rows.length === 0) return [];
+  const boundedRows = rows.slice(0, 20);
+  const firstRowKeys =
+    Array.isArray(columnsHint) && columnsHint.length > 0
+      ? columnsHint.slice(0, 40)
+      : Object.keys(boundedRows[0] || {}).slice(0, 40);
+  if (firstRowKeys.length === 0) return boundedRows;
+
+  return boundedRows.map((row) => {
+    const rowKeys = Object.keys(row || {});
+    if (rowKeys.length <= 40) return row;
+    const partial: Record<string, any> = {};
+    for (let i = 0; i < firstRowKeys.length; i++) {
+      const k = firstRowKeys[i];
+      partial[k] = row[k];
+    }
+    return partial;
+  });
+}
+
 function clampDataset(dataset: DatasetRecord): DatasetRecord {
-  return {
+  const safeColumns = Array.isArray(dataset.columns) ? dataset.columns.slice(0, 200) : [];
+  return sanitizeFirestoreValue({
     ...dataset,
     filename: String(dataset.filename || 'dataset.csv').slice(0, 256),
     format: dataset.format === 'xlsx' ? 'xlsx' : 'csv',
     rowCount: Math.max(0, Math.floor(Number(dataset.rowCount) || 0)),
     columnCount: Math.max(0, Math.floor(Number(dataset.columnCount) || 0)),
-    columns: Array.isArray(dataset.columns) ? dataset.columns.slice(0, 200) : [],
-    previewData: Array.isArray(dataset.previewData) ? dataset.previewData.slice(0, 100) : [],
+    columns: safeColumns,
+    previewData: boundPreviewRows(dataset.previewData, safeColumns),
     ...(typeof dataset.cleanedVersionsCount === 'number'
       ? { cleanedVersionsCount: Math.max(0, Math.floor(dataset.cleanedVersionsCount)) }
       : {}),
-  };
+  });
 }
 
 export async function saveDataset(dataset: DatasetRecord): Promise<void> {
@@ -863,11 +1147,12 @@ export async function updateDataset(
   }
   if (Array.isArray(safeUpdates.columns)) safeUpdates.columns = safeUpdates.columns.slice(0, 200);
   if (Array.isArray(safeUpdates.previewData)) {
-    safeUpdates.previewData = safeUpdates.previewData.slice(0, 100);
+    safeUpdates.previewData = boundPreviewRows(safeUpdates.previewData, safeUpdates.columns);
   }
   delete safeUpdates.createdAt;
+  const sanitizedUpdates = sanitizeFirestoreValue(safeUpdates);
 
-  updateLocalItemById<DatasetRecord>(colPath, ownerId, datasetId, safeUpdates);
+  updateLocalItemById<DatasetRecord>(colPath, ownerId, datasetId, sanitizedUpdates);
   if (!canSyncWithCloudFirestore(ownerId)) {
     return;
   }
@@ -875,7 +1160,7 @@ export async function updateDataset(
   try {
     const docRef = doc(db, 'datasets', datasetId);
     await updateDoc(docRef, {
-      ...safeUpdates,
+      ...sanitizedUpdates,
       updatedAt: new Date().toISOString(),
     });
   } catch (err: any) {
@@ -937,7 +1222,7 @@ export interface CleaningJobRecord {
 }
 
 export function buildFirestoreCleaningJobPayload(job: CleaningJobRecord): CleaningJobRecord {
-  return {
+  return sanitizeFirestoreValue({
     id: String(job.id).slice(0, 128),
     ownerId: String(job.ownerId).slice(0, 128),
     datasetId: String(job.datasetId).slice(0, 128),
@@ -952,7 +1237,7 @@ export function buildFirestoreCleaningJobPayload(job: CleaningJobRecord): Cleani
     },
     createdAt: String(job.createdAt || new Date().toISOString()).slice(0, 64),
     updatedAt: String(job.updatedAt || new Date().toISOString()).slice(0, 64),
-  };
+  });
 }
 
 export async function saveCleaningJob(job: CleaningJobRecord): Promise<void> {

@@ -9,9 +9,12 @@ import {
 import {
   HYDROGEN_MODEL_ID,
   callWithBoundedRetry,
-  getErrorStatusCode,
   parseWebsiteGeneratorJson,
 } from './websiteGenerationService';
+import {
+  GeminiRequestManager,
+  normalizeGeminiError,
+} from './geminiRequestManager';
 
 export const ALLOWED_CLEANING_OPERATIONS: ReadonlySet<CleaningOperationType> = new Set([
   'remove_duplicates',
@@ -28,6 +31,12 @@ export const ALLOWED_CLEANING_OPERATIONS: ReadonlySet<CleaningOperationType> = n
   'normalize_categories',
   'remove_invalid_emails',
   'remove_outliers',
+  'reorder_columns',
+  'sort_rows',
+  'replace_values',
+  'split_column',
+  'merge_columns',
+  'remove_invalid_phones',
 ]);
 
 export const ALLOWED_MISSING_STRATEGIES: ReadonlySet<CleaningStrategy> = new Set([
@@ -58,6 +67,8 @@ export interface ValidatedCleaningPlan {
   status: CleaningPlanStatus;
   explanation: string;
   clarificationQuestion?: string;
+  pendingColumnRemovalCount?: number;
+  requiresConfirmation?: boolean;
   operations: CleaningOperation[];
 }
 
@@ -74,7 +85,7 @@ export const CLEANING_PLAN_RESPONSE_SCHEMA: Schema = {
       type: Type.STRING,
       enum: ['ready', 'needs_clarification', 'invalid_column'],
       description:
-        "Use 'ready' when the instruction is clear and maps to valid columns. Use 'invalid_column' if a requested column does not exist. Use 'needs_clarification' if the request is ambiguous (e.g., 'clean missing values' without specifying column/method or vague 'fix the data').",
+        "Use 'ready' when the instruction is clear and maps to valid columns. Use 'invalid_column' if a requested column does not exist. Use 'needs_clarification' if the request is ambiguous (e.g., 'Remove 5 columns' without naming them, 'clean missing values' without specifying strategy, or 'fix the data').",
     },
     explanation: {
       type: Type.STRING,
@@ -84,7 +95,12 @@ export const CLEANING_PLAN_RESPONSE_SCHEMA: Schema = {
     clarificationQuestion: {
       type: Type.STRING,
       description:
-        'Clear question asking the user to clarify ambiguity or pick an existing column when status is not ready.',
+        'Clear question asking the user to clarify ambiguity or pick existing columns when status is not ready.',
+    },
+    pendingColumnRemovalCount: {
+      type: Type.NUMBER,
+      description:
+        'If the user requested removing N columns without naming which columns (e.g. "Remove 5 columns"), set status="needs_clarification" and set this to N.',
     },
     operations: {
       type: Type.ARRAY,
@@ -110,7 +126,7 @@ export const CLEANING_PLAN_RESPONSE_SCHEMA: Schema = {
           columns: {
             type: Type.ARRAY,
             items: { type: Type.STRING },
-            description: 'Optional list of target columns for deduplication or trimming.',
+            description: 'List of target columns (e.g. for remove_column, trim_whitespace, remove_duplicates, merge_columns, reorder_columns).',
           },
           strategy: {
             type: Type.STRING,
@@ -119,7 +135,7 @@ export const CLEANING_PLAN_RESPONSE_SCHEMA: Schema = {
           },
           fillValue: {
             type: Type.STRING,
-            description: 'Custom replacement value when strategy is fill_custom.',
+            description: 'REQUIRED custom replacement value when strategy is fill_custom (e.g. "0", "Unknown").',
           },
           caseType: {
             type: Type.STRING,
@@ -141,7 +157,7 @@ export const CLEANING_PLAN_RESPONSE_SCHEMA: Schema = {
           },
           columnName: {
             type: Type.STRING,
-            description: 'Column name to delete for remove_column.',
+            description: 'Single column name to delete for remove_column.',
           },
           operator: {
             type: Type.STRING,
@@ -157,7 +173,7 @@ export const CLEANING_PLAN_RESPONSE_SCHEMA: Schema = {
               'not_empty',
               'is_empty',
             ],
-            description: 'Predicate operator for filter_rows.',
+            description: 'Predicate operator for filter_rows (defines which rows to KEEP).',
           },
           value: {
             type: Type.STRING,
@@ -180,7 +196,7 @@ export const CLEANING_PLAN_RESPONSE_SCHEMA: Schema = {
           emailMode: {
             type: Type.STRING,
             enum: ['drop_row', 'clear_cell'],
-            description: 'Action for remove_invalid_emails.',
+            description: 'Action for remove_invalid_emails or remove_invalid_phones.',
           },
           mappingPairs: {
             type: Type.ARRAY,
@@ -193,6 +209,49 @@ export const CLEANING_PLAN_RESPONSE_SCHEMA: Schema = {
                 to: { type: Type.STRING },
               },
             },
+          },
+          findValue: {
+            type: Type.STRING,
+            description: 'Text or value to find for replace_values.',
+          },
+          replaceValue: {
+            type: Type.STRING,
+            description: 'Replacement value for replace_values.',
+          },
+          exactMatch: {
+            type: Type.BOOLEAN,
+            description: 'Whether replace_values matches full cell value (true) or substring (false).',
+          },
+          direction: {
+            type: Type.STRING,
+            enum: ['asc', 'desc'],
+            description: 'Sort order for sort_rows.',
+          },
+          order: {
+            type: Type.ARRAY,
+            items: { type: Type.STRING },
+            description: 'Ordered column names for reorder_columns.',
+          },
+          delimiter: {
+            type: Type.STRING,
+            description: 'Delimiter for split_column.',
+          },
+          intoColumns: {
+            type: Type.ARRAY,
+            items: { type: Type.STRING },
+            description: 'Target column names for split_column.',
+          },
+          separator: {
+            type: Type.STRING,
+            description: 'Separator for merge_columns.',
+          },
+          targetColumn: {
+            type: Type.STRING,
+            description: 'Destination column name for merge_columns.',
+          },
+          dropOriginals: {
+            type: Type.BOOLEAN,
+            description: 'Whether merge_columns drops original source columns.',
           },
         },
       },
@@ -208,12 +267,19 @@ Your job is to translate a user's natural-language data cleaning request into a 
 
 CRITICAL RULES:
 1. EXECUTE ONLY WHAT IS ASKED: Include ONLY operations directly requested by the user. NEVER add unrequested extra operations (do NOT silently drop columns, deduplicate, fill missing values, trim strings, or change casing unless the user asked for them).
-2. VALIDATE COLUMNS: Every column name referenced must exist in the provided dataset columns. If the user names a column that does not exist (and isn't 'ALL'), set status='invalid_column', keep operations=[], and explain which columns exist.
-3. CLARIFY AMBIGUITY: If the instruction is genuinely vague (e.g., "fix the data", "clean everything", "make it better", "handle missing values" when the user did not indicate whether to drop rows or fill with mean/median/mode/custom value), set status='needs_clarification', keep operations=[], and ask a concise clarificationQuestion.
-4. NEVER WRITE CODE: Never emit JavaScript, Python, or SQL code. Only emit structured operations using the schema enums.
-5. MULTI-STEP REQUESTS: When the user clearly specifies multiple actions (e.g., "Trim whitespace, remove duplicates, and standardize signup_date to YYYY-MM-DD"), return them in logical execution order.
-6. CATEGORY NORMALIZATION: For inconsistent category labels (e.g. "active", "ACTIVE", "Active"), inspect sampleRows and build mappingPairs mapping dirty variants to the canonical label (plus caseType if appropriate).
-7. DATES & OUTLIERS & EMAILS: Use 'standardize_date' for formatting dates to YYYY-MM-DD, 'remove_invalid_emails' for validating/dropping invalid email rows, and 'remove_outliers' for numeric outlier filtering.`;
+2. MISSING VALUES:
+   - When the user says "Replace all missing values with 0" or specifies a custom fill value, use type='handle_missing', column='ALL' (or specified column), strategy='fill_custom', fillValue='0' (EXACT requested value — never substitute 'NA' or 'N/A' unless the user literally requested 'NA').
+   - Never assume missing strategy if the user did not specify one.
+3. VALIDATE COLUMNS: Every column name referenced must exist in the provided dataset columns. If the user names a column that does not exist (and isn't 'ALL'), set status='invalid_column', keep operations=[], and explain which columns exist.
+4. CLARIFY AMBIGUOUS COLUMN COUNTS OR VAGUE PROMPTS:
+   - If the user says "Remove 5 columns" or "Drop 3 columns" WITHOUT specifying exact column names, you MUST set status='needs_clarification', operations=[], pendingColumnRemovalCount=<count>, and ask which exact columns to remove. NEVER silently pick or delete columns!
+   - If the instruction is genuinely vague (e.g., "fix the data", "clean everything", "handle missing values" with no strategy), set status='needs_clarification', keep operations=[], and ask a concise clarificationQuestion.
+5. FILTER SEMANTICS: 'filter_rows' operator defines which rows to KEEP! For example, "Remove rows where salary < 20000" MUST emit operator='greater_or_equal', value='20000' (so rows < 20000 are removed).
+6. NEVER WRITE CODE: Never emit JavaScript, Python, or SQL code. Only emit structured operations using the schema enums.
+7. MULTI-STEP REQUESTS: Return steps in exact logical execution order.
+8. CATEGORIES / GENDER / DATES / PHONES / VALUES:
+   - Use 'normalize_categories' with explicit mappingPairs for inconsistent labels (e.g. Gender 'M'/'male' -> 'Male', 'F'/'female' -> 'Female') leaving unknown categories unmapped.
+   - Use 'standardize_date' for YYYY-MM-DD formatting, 'remove_invalid_emails' for emails, 'remove_invalid_phones' for phones, 'remove_outliers' for outliers, 'replace_values' for find-and-replace.`;
 
   const userPrompt = `User Cleaning Instruction:
 "${instruction}"
@@ -225,13 +291,18 @@ Dataset Profile:
 - Duplicate Rows Detected: ${datasetProfile.duplicateRowCount}
 - Columns & Inferred Types:
 ${datasetProfile.columns
+  .slice(0, 120)
   .map(
     (c) =>
       `  * ${c} (type: ${datasetProfile.columnTypes[c] || 'string'}, missing: ${
         datasetProfile.missingCounts[c] ?? 0
       })`
   )
-  .join('\n')}
+  .join('\n')}${
+    datasetProfile.columns.length > 120
+      ? `\n  ... (${datasetProfile.columns.length - 120} more columns)`
+      : ''
+  }
 
 Representative Sample Rows (first ${datasetProfile.sampleRows.length} rows only):
 ${JSON.stringify(datasetProfile.sampleRows, null, 2)}
@@ -258,6 +329,13 @@ function resolveCanonicalColumn(
   if (match) {
     return { found: true, canonical: match };
   }
+  const normalizedSpace = lower.replace(/[\s_-]+/g, '_');
+  const normMatch = availableColumns.find(
+    (c) => c.toLowerCase().replace(/[\s_-]+/g, '_') === normalizedSpace
+  );
+  if (normMatch) {
+    return { found: true, canonical: normMatch };
+  }
   return { found: false };
 }
 
@@ -270,8 +348,7 @@ function sanitizeSafeKey(value: string): string {
 }
 
 /**
- * Validates and canonicalizes an AI-produced cleaning plan against the real dataset columns.
- * Guarantees no unknown operations, no non-existent column silently modified, and no code execution.
+ * Validates and canonicalizes an AI-produced or local cleaning plan against real dataset columns.
  */
 export function validateCleaningPlan(
   rawPlan: unknown,
@@ -297,6 +374,10 @@ export function validateCleaningPlan(
     typeof raw.clarificationQuestion === 'string' && raw.clarificationQuestion.trim()
       ? raw.clarificationQuestion.trim()
       : undefined;
+  const pendingColumnRemovalCount =
+    typeof raw.pendingColumnRemovalCount === 'number' && raw.pendingColumnRemovalCount > 0
+      ? Math.floor(raw.pendingColumnRemovalCount)
+      : undefined;
 
   if (rawStatus === 'invalid_column') {
     return {
@@ -304,7 +385,7 @@ export function validateCleaningPlan(
       explanation,
       clarificationQuestion:
         clarificationQuestion ||
-        `Please choose from existing columns: ${availableColumns.join(', ')}.`,
+        `Please choose from existing columns: ${availableColumns.slice(0, 25).join(', ')}.`,
       operations: [],
     };
   }
@@ -316,6 +397,7 @@ export function validateCleaningPlan(
       clarificationQuestion:
         clarificationQuestion ||
         'Could you clarify which column(s) and transformation rule you want to apply?',
+      ...(pendingColumnRemovalCount ? { pendingColumnRemovalCount } : {}),
       operations: [],
     };
   }
@@ -327,7 +409,7 @@ export function validateCleaningPlan(
       explanation: 'No specific cleaning operations were identified from your instruction.',
       clarificationQuestion:
         clarificationQuestion ||
-        'Please describe a concrete cleaning action (for example: "Remove duplicate rows" or "Fill missing age with mean").',
+        'Please describe a concrete cleaning action (for example: "Replace all missing values with 0" or "Remove duplicate rows").',
       operations: [],
     };
   }
@@ -336,8 +418,12 @@ export function validateCleaningPlan(
   const missingColumnsReferenced: string[] = [];
 
   for (let i = 0; i < rawOps.length; i++) {
-    const item = rawOps[i];
-    if (!item || typeof item !== 'object') continue;
+    const rawItem = rawOps[i];
+    if (!rawItem || typeof rawItem !== 'object') continue;
+    const item = {
+      ...(rawItem.params && typeof rawItem.params === 'object' ? rawItem.params : {}),
+      ...rawItem,
+    };
     const opType = String(item.type || '').trim() as CleaningOperationType;
     if (!ALLOWED_CLEANING_OPERATIONS.has(opType)) {
       return {
@@ -368,19 +454,17 @@ export function validateCleaningPlan(
           resolvedCols = [];
           for (const rawCol of item.columns) {
             const res = resolveCanonicalColumn(String(rawCol), availableColumns);
-            if (!res.found || res.isAll) {
-              missingColumnsReferenced.push(String(rawCol));
-            } else if (res.canonical) {
-              resolvedCols.push(res.canonical);
-            }
+            if (!res.found || res.isAll) missingColumnsReferenced.push(String(rawCol));
+            else if (res.canonical) resolvedCols.push(res.canonical);
           }
-        } else if (typeof item.column === 'string' && item.column.trim() && item.column.trim().toUpperCase() !== 'ALL') {
+        } else if (
+          typeof item.column === 'string' &&
+          item.column.trim() &&
+          item.column.trim().toUpperCase() !== 'ALL'
+        ) {
           const res = resolveCanonicalColumn(item.column, availableColumns);
-          if (!res.found) {
-            missingColumnsReferenced.push(item.column);
-          } else if (res.canonical) {
-            resolvedCols = [res.canonical];
-          }
+          if (!res.found) missingColumnsReferenced.push(item.column);
+          else if (res.canonical) resolvedCols = [res.canonical];
         }
         validatedOps.push({
           id: opId,
@@ -404,7 +488,11 @@ export function validateCleaningPlan(
             if (!res.found) missingColumnsReferenced.push(String(rawCol));
             else if (res.canonical) resolvedCols.push(res.canonical);
           }
-        } else if (typeof item.column === 'string' && item.column.trim() && item.column.trim().toUpperCase() !== 'ALL') {
+        } else if (
+          typeof item.column === 'string' &&
+          item.column.trim() &&
+          item.column.trim().toUpperCase() !== 'ALL'
+        ) {
           const res = resolveCanonicalColumn(item.column, availableColumns);
           if (!res.found) missingColumnsReferenced.push(item.column);
           else if (res.canonical) resolvedCols = [res.canonical];
@@ -412,7 +500,8 @@ export function validateCleaningPlan(
         validatedOps.push({
           id: opId,
           type: opType,
-          params: resolvedCols && resolvedCols.length > 0 ? { columns: resolvedCols } : { column: 'ALL' },
+          params:
+            resolvedCols && resolvedCols.length > 0 ? { columns: resolvedCols } : { column: 'ALL' },
           description: desc,
         });
         break;
@@ -425,11 +514,32 @@ export function validateCleaningPlan(
             status: 'needs_clarification',
             explanation: 'Missing-value handling requires specifying a strategy.',
             clarificationQuestion:
-              'How should missing values be handled? (e.g., drop rows, fill with mean/median/mode, or fill with a custom value)',
+              'How should missing values be handled? (e.g., replace with 0, drop rows, or fill with mean/median/mode)',
             operations: [],
           };
         }
-        const rawTarget = item.column || (Array.isArray(item.columns) ? item.columns[0] : 'ALL');
+        const resolvedFillValue =
+          item.fillValue !== undefined && item.fillValue !== null && String(item.fillValue).trim() !== ''
+            ? String(item.fillValue)
+            : item.value !== undefined && item.value !== null && String(item.value).trim() !== ''
+            ? String(item.value)
+            : item.replaceValue !== undefined &&
+              item.replaceValue !== null &&
+              String(item.replaceValue).trim() !== ''
+            ? String(item.replaceValue)
+            : undefined;
+        if (strategy === 'fill_custom' && resolvedFillValue === undefined) {
+          return {
+            status: 'needs_clarification',
+            explanation: 'Custom missing-value replacement requires an explicit replacement value.',
+            clarificationQuestion:
+              'What exact value would you like to use to replace missing values (for example, 0 or Unknown)?',
+            operations: [],
+          };
+        }
+        const rawTarget =
+          item.column ||
+          (Array.isArray(item.columns) && item.columns.length > 0 ? item.columns[0] : 'ALL');
         const res = resolveCanonicalColumn(String(rawTarget), availableColumns);
         if (!res.found) {
           missingColumnsReferenced.push(String(rawTarget));
@@ -440,7 +550,7 @@ export function validateCleaningPlan(
             params: {
               column: res.canonical,
               strategy,
-              ...(item.fillValue !== undefined ? { fillValue: item.fillValue } : {}),
+              ...(resolvedFillValue !== undefined ? { fillValue: resolvedFillValue } : {}),
             },
             description: desc,
           });
@@ -518,7 +628,7 @@ export function validateCleaningPlan(
           const res = resolveCanonicalColumn(String(c), availableColumns);
           if (!res.found || res.isAll) {
             missingColumnsReferenced.push(String(c));
-          } else if (res.canonical) {
+          } else if (res.canonical && !resolved.includes(res.canonical)) {
             resolved.push(res.canonical);
           }
         }
@@ -606,7 +716,8 @@ export function validateCleaningPlan(
         break;
       }
 
-      case 'remove_invalid_emails': {
+      case 'remove_invalid_emails':
+      case 'remove_invalid_phones': {
         const res = resolveCanonicalColumn(item.column || item.columnName, availableColumns);
         if (!res.found || res.isAll) {
           missingColumnsReferenced.push(String(item.column || item.columnName || ''));
@@ -644,6 +755,121 @@ export function validateCleaningPlan(
         }
         break;
       }
+
+      case 'replace_values': {
+        const rawTarget = item.column || 'ALL';
+        const res = resolveCanonicalColumn(String(rawTarget), availableColumns);
+        if (!res.found) {
+          missingColumnsReferenced.push(String(rawTarget));
+        } else if (item.findValue === undefined || item.replaceValue === undefined) {
+          return {
+            status: 'needs_clarification',
+            explanation: 'Value replacement requires both a search value and replacement value.',
+            clarificationQuestion: 'Which value should be replaced, and what should replace it?',
+            operations: [],
+          };
+        } else {
+          validatedOps.push({
+            id: opId,
+            type: opType,
+            params: {
+              column: res.canonical,
+              findValue: item.findValue,
+              replaceValue: item.replaceValue,
+              exactMatch: item.exactMatch !== false,
+            },
+            description: desc,
+          });
+        }
+        break;
+      }
+
+      case 'sort_rows': {
+        const res = resolveCanonicalColumn(item.column || item.columnName, availableColumns);
+        if (!res.found || res.isAll) {
+          missingColumnsReferenced.push(String(item.column || item.columnName || ''));
+        } else {
+          validatedOps.push({
+            id: opId,
+            type: opType,
+            params: {
+              column: res.canonical,
+              direction: item.direction === 'desc' ? 'desc' : 'asc',
+            },
+            description: desc,
+          });
+        }
+        break;
+      }
+
+      case 'reorder_columns': {
+        const orderInput: string[] = Array.isArray(item.order)
+          ? item.order
+          : Array.isArray(item.columns)
+          ? item.columns
+          : [];
+        const resolvedOrder: string[] = [];
+        for (const c of orderInput) {
+          const res = resolveCanonicalColumn(String(c), availableColumns);
+          if (!res.found || res.isAll) missingColumnsReferenced.push(String(c));
+          else if (res.canonical) resolvedOrder.push(res.canonical);
+        }
+        if (resolvedOrder.length > 0) {
+          validatedOps.push({
+            id: opId,
+            type: opType,
+            params: { order: resolvedOrder },
+            description: desc,
+          });
+        }
+        break;
+      }
+
+      case 'split_column': {
+        const res = resolveCanonicalColumn(item.column || item.columnName, availableColumns);
+        if (!res.found || res.isAll) {
+          missingColumnsReferenced.push(String(item.column || item.columnName || ''));
+        } else {
+          const into = Array.isArray(item.intoColumns)
+            ? item.intoColumns.map((x: any) => sanitizeSafeKey(String(x))).filter(Boolean)
+            : [`${res.canonical}_1`, `${res.canonical}_2`];
+          validatedOps.push({
+            id: opId,
+            type: opType,
+            params: {
+              column: res.canonical,
+              delimiter: typeof item.delimiter === 'string' && item.delimiter.length > 0 ? item.delimiter : ' ',
+              intoColumns: into,
+            },
+            description: desc,
+          });
+        }
+        break;
+      }
+
+      case 'merge_columns': {
+        const colsInput: string[] = Array.isArray(item.columns) ? item.columns : [];
+        const resolved: string[] = [];
+        for (const c of colsInput) {
+          const res = resolveCanonicalColumn(String(c), availableColumns);
+          if (!res.found || res.isAll) missingColumnsReferenced.push(String(c));
+          else if (res.canonical) resolved.push(res.canonical);
+        }
+        if (resolved.length >= 2) {
+          validatedOps.push({
+            id: opId,
+            type: opType,
+            params: {
+              columns: resolved,
+              separator: typeof item.separator === 'string' ? item.separator : ' ',
+              targetColumn: sanitizeSafeKey(String(item.targetColumn || 'merged_column')),
+              dropOriginals: Boolean(item.dropOriginals),
+            },
+            description: desc,
+          });
+        }
+        break;
+      }
     }
   }
 
@@ -652,7 +878,7 @@ export function validateCleaningPlan(
     return {
       status: 'invalid_column',
       explanation: `Column${uniqueMissing.length > 1 ? 's' : ''} not found in dataset: ${uniqueMissing.join(', ')}.`,
-      clarificationQuestion: `Available columns are: ${availableColumns.join(', ')}. Please specify one of these columns.`,
+      clarificationQuestion: `Available columns are: ${availableColumns.slice(0, 25).join(', ')}. Please specify one of these columns.`,
       operations: [],
     };
   }
@@ -678,13 +904,23 @@ export async function executeDataCleaningPlanRequest(options: {
   input: DataCleaningPlanInput;
   apiKeyConfigured: boolean;
   model?: string;
+  candidateModels?: string[];
+  useModelRouter?: boolean;
   generateContent: (params: any) => Promise<{ text?: string }>;
+  requestManager?: GeminiRequestManager;
+  scopeKey?: string;
+  skipCache?: boolean;
 }): Promise<{ status: number; body: Record<string, any> }> {
   const {
     input,
     apiKeyConfigured,
-    model = HYDROGEN_MODEL_ID,
+    model = 'gemini-3.1-flash-lite',
+    candidateModels,
+    useModelRouter = true,
     generateContent,
+    requestManager,
+    scopeKey = 'guest:anon',
+    skipCache = false,
   } = options;
 
   const instruction = String(input.instruction || '').trim();
@@ -708,17 +944,21 @@ export async function executeDataCleaningPlanRequest(options: {
     return {
       status: 503,
       body: {
-        error: 'Gemini API key is not configured on the server. Please check the Secrets panel.',
+        code: 'API_KEY_MISSING',
+        demoModeAvailable: true,
+        recommendDemoMode: true,
+        error: 'Gemini API key is not configured on the server. Switch to Demo Mode to continue.',
       },
     };
   }
 
-  // Ensure only a bounded sample of rows is forwarded to the AI prompt
   const sanitizedProfile: DatasetAiProfile = {
     filename: String(profile.filename || 'dataset.csv').slice(0, 256),
     rowCount: Number(profile.rowCount) || 0,
     columnCount: profile.columns.length,
-    columns: profile.columns.slice(0, 200).map((c) => String(c)),
+    columns: profile.columns
+      .slice(0, 200)
+      .map((c: any) => (typeof c === 'object' && c !== null && c.name ? String(c.name) : String(c))),
     columnTypes: profile.columnTypes || {},
     missingCounts: profile.missingCounts || {},
     duplicateRowCount: Number(profile.duplicateRowCount) || 0,
@@ -731,8 +971,42 @@ export async function executeDataCleaningPlanRequest(options: {
   });
 
   try {
-    const response = await callWithBoundedRetry(() =>
-      generateContent({
+    let response: { text?: string };
+    let modelUsed = model;
+    let attemptedModels: string[] = [model];
+    let fallbackUsed = false;
+    let modelFallbackNotice: string | undefined;
+
+    if (requestManager && useModelRouter) {
+      const routed = await requestManager.executeWithRouting({
+        agentType: 'data_cleaning',
+        scopeKey,
+        preferredModel: model,
+        candidateModels,
+        contents: userPrompt,
+        config: {
+          systemInstruction,
+          responseMimeType: 'application/json',
+          responseSchema: CLEANING_PLAN_RESPONSE_SCHEMA,
+        },
+        skipCache,
+        validateResponse: (rawText) => {
+          const parsed = parseWebsiteGeneratorJson(rawText);
+          return parsed.success && parsed.data && typeof parsed.data === 'object'
+            ? { valid: true }
+            : { valid: false, reason: 'Invalid JSON cleaning plan from model.' };
+        },
+        generateContent,
+      });
+      response = routed.response;
+      modelUsed = routed.modelUsed;
+      attemptedModels = routed.attemptedModels || [modelUsed];
+      fallbackUsed = Boolean(routed.fallbackUsed);
+      modelFallbackNotice = routed.modelFallbackNotice;
+    } else if (requestManager) {
+      const execRes = await requestManager.execute({
+        agentType: 'data_cleaning',
+        scopeKey,
         model,
         contents: userPrompt,
         config: {
@@ -740,15 +1014,35 @@ export async function executeDataCleaningPlanRequest(options: {
           responseMimeType: 'application/json',
           responseSchema: CLEANING_PLAN_RESPONSE_SCHEMA,
         },
-      })
-    );
+        skipCache,
+        generateContent,
+      });
+      response = execRes.response;
+      modelUsed = execRes.modelUsed;
+    } else {
+      response = await callWithBoundedRetry(() =>
+        generateContent({
+          model,
+          contents: userPrompt,
+          config: {
+            systemInstruction,
+            responseMimeType: 'application/json',
+            responseSchema: CLEANING_PLAN_RESPONSE_SCHEMA,
+          },
+        })
+      );
+    }
 
     const parsed = parseWebsiteGeneratorJson(response.text);
     if (!parsed.success || !parsed.data || typeof parsed.data !== 'object') {
       return {
         status: 502,
         body: {
-          error: 'Could not parse a valid data cleaning plan from the AI response. Please try rephrasing your instruction.',
+          modelUsed,
+          attemptedModels,
+          demoModeAvailable: true,
+          error:
+            'Could not parse a valid data cleaning plan from the AI response. Please try rephrasing your instruction.',
         },
       };
     }
@@ -759,26 +1053,27 @@ export async function executeDataCleaningPlanRequest(options: {
       body: {
         success: true,
         requestId: `req_clean_${Date.now()}`,
+        executionMode: 'live',
+        modelUsed,
+        attemptedModels,
+        fallbackUsed,
+        ...(modelFallbackNotice ? { modelFallbackNotice } : {}),
         plan: validatedPlan,
       },
     };
   } catch (error: any) {
-    const statusCode = getErrorStatusCode(error);
-    if (statusCode === 429) {
-      return {
-        status: 429,
-        body: { error: 'Gemini rate limit or quota exceeded. Please wait a moment and retry.' },
-      };
-    }
-    if (statusCode === 503) {
-      return {
-        status: 503,
-        body: { error: 'Gemini model is temporarily unavailable (HTTP 503). Please retry shortly.' },
-      };
-    }
+    const normalized = normalizeGeminiError(error);
     return {
-      status: 500,
-      body: { error: 'Failed to analyze data cleaning instruction. Please retry.' },
+      status: normalized.status,
+      body: {
+        code: normalized.code,
+        ...(error?.attemptedModels ? { attemptedModels: error.attemptedModels } : {}),
+        ...(error?.allModelsExhausted ? { allModelsExhausted: true } : {}),
+        ...(error?.recommendDemoMode ? { recommendDemoMode: true } : {}),
+        demoModeAvailable: true,
+        ...(normalized.retryAfterSeconds ? { retryAfterSeconds: normalized.retryAfterSeconds } : {}),
+        error: normalized.message,
+      },
     };
   }
 }

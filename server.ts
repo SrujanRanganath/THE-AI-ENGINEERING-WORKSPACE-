@@ -10,14 +10,17 @@ import {
   getOtpSecurityStatus,
   processOtpSendRequest,
 } from './src/server/otpService';
+import crypto from 'node:crypto';
 import {
   HYDROGEN_MODEL_ID,
-  callWithBoundedRetry,
   executeWebsiteGeneration,
-  getErrorStatusCode,
   parseWebsiteGeneratorJson,
   sanitizeManifestFilePath,
 } from './src/server/websiteGenerationService';
+import {
+  GeminiRequestManager,
+  normalizeGeminiError,
+} from './src/server/geminiRequestManager';
 import { executeDataCleaningPlanRequest } from './src/server/dataCleaningPlanner';
 import { PublishedWebsiteSnapshot } from './src/utils/publishPreview';
 import {
@@ -74,6 +77,7 @@ export interface WorkspaceAppDependencies {
   publishedSnapshotStore?: PublishedSnapshotStore;
   verifyToken?: (token: string | undefined) => Promise<FirebaseTokenVerificationResult>;
   generateContent?: (params: any) => Promise<{ text?: string }>;
+  requestManager?: GeminiRequestManager;
 }
 
 export function isAllowedCorsOrigin(originHeader: string | undefined, hostHeader?: string): boolean {
@@ -131,7 +135,10 @@ export function createWorkspaceApp(deps: WorkspaceAppDependencies = {}): Express
       res.setHeader('Access-Control-Allow-Origin', origin);
       res.setHeader('Vary', 'Origin');
       res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-      res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+      res.setHeader(
+        'Access-Control-Allow-Headers',
+        'Content-Type, Authorization, X-Workspace-Session'
+      );
     }
 
     if (req.method === 'OPTIONS') {
@@ -158,6 +165,28 @@ export function createWorkspaceApp(deps: WorkspaceAppDependencies = {}): Express
 
   const generateContent =
     deps.generateContent ?? ((params: any) => ai!.models.generateContent(params));
+  const requestManager = deps.requestManager ?? new GeminiRequestManager();
+
+  const resolveAiScopeKey = async (req: Request): Promise<string> => {
+    const bearer = extractBearerToken(req.headers.authorization);
+    if (bearer) {
+      try {
+        const verified = await verifyToken(bearer);
+        if (verified.valid) {
+          return `uid:${verified.uid}`;
+        }
+      } catch {
+        // Fall through to isolated guest session scope
+      }
+    }
+    const rawSession =
+      typeof req.headers['x-workspace-session'] === 'string' &&
+      req.headers['x-workspace-session'].trim()
+        ? req.headers['x-workspace-session'].trim()
+        : `${req.ip || 'local'}:${req.headers['user-agent'] || 'ua'}`;
+    const digest = crypto.createHash('sha256').update(rawSession).digest('hex').slice(0, 24);
+    return `guest:${digest}`;
+  };
 
   // Persistent published snapshot store:
   // - production: strict Firebase Firestore persistence (no local JSON / in-memory storage)
@@ -173,13 +202,26 @@ export function createWorkspaceApp(deps: WorkspaceAppDependencies = {}): Express
       }),
     });
 
+  const modelVerificationCachePath = path.resolve(
+    __dirname,
+    '.local-data',
+    'model-verification-cache.json'
+  );
+  let lastManualVerifyMs = 0;
+
   // ----------------------------------------------------
-  // Health Check Endpoint
+  // Health Check & Model Registry Endpoints (Zero secret leaks)
   // ----------------------------------------------------
   app.get('/api/health', (_req: Request, res: Response) => {
     const emailStatus = getEmailProviderStatus();
     const otpSecurity = getOtpSecurityStatus();
     const distIndexExists = fs.existsSync(path.resolve(__dirname, 'dist', 'index.html'));
+    const aiDiagnostics = requestManager.getDiagnostics(Boolean(apiKey));
+    const modelRegistry = requestManager.getModelRegistrySnapshot(
+      Boolean(apiKey),
+      PRIMARY_MODEL,
+      WEBSITE_FALLBACK_MODEL
+    );
     res.json({
       status: 'ok',
       timestamp: new Date().toISOString(),
@@ -187,6 +229,14 @@ export function createWorkspaceApp(deps: WorkspaceAppDependencies = {}): Express
       hasGeminiKey: Boolean(apiKey),
       primaryModel: PRIMARY_MODEL,
       websiteGeneratorModel: WEBSITE_GENERATOR_MODEL,
+      currentSelectedModel: aiDiagnostics.currentSelectedModel,
+      lightweightPlanningModel: aiDiagnostics.lightweightPlanningModel,
+      fallbackModelSelected: aiDiagnostics.fallbackModelSelected,
+      demoModeAvailable: true,
+      recommendDemoMode: aiDiagnostics.recommendDemoMode,
+      aiServiceStatus: aiDiagnostics.aiServiceStatus,
+      aiDiagnostics,
+      modelRegistry,
       emailDeliveryConfigured: emailStatus.configured,
       emailProvider: emailStatus.provider,
       otpHmacSecretConfigured: otpSecurity.otpHmacSecretConfigured,
@@ -195,6 +245,106 @@ export function createWorkspaceApp(deps: WorkspaceAppDependencies = {}): Express
       sandboxOtpEnabled: otpSecurity.sandboxOtpEnabled,
       distBuilt: distIndexExists,
     });
+  });
+
+  app.get('/api/ai/models/status', (_req: Request, res: Response) => {
+    const aiDiagnostics = requestManager.getDiagnostics(Boolean(apiKey));
+    const modelRegistry = requestManager.getModelRegistrySnapshot(
+      Boolean(apiKey),
+      PRIMARY_MODEL,
+      WEBSITE_FALLBACK_MODEL
+    );
+    const verifiedAccessibleModels = modelRegistry
+      .filter((m) => m.accessStatus === 'verified')
+      .map((m) => m.modelId);
+    const coolingDownModels = modelRegistry
+      .filter((m) => m.availabilityState === 'cooldown')
+      .map((m) => m.modelId);
+    const lastSuccessAttr = aiDiagnostics.recentAttributions.find((a) => a.status === 'success');
+    const lastFailedAttr = aiDiagnostics.recentAttributions.find((a) => a.status === 'failed');
+    const firstModelError = modelRegistry.find((m) => m.lastError)?.lastError || null;
+
+    res.json({
+      status: 'ok',
+      timestamp: new Date().toISOString(),
+      hasGeminiKey: Boolean(apiKey),
+      primaryModel: PRIMARY_MODEL,
+      currentSelectedModel: aiDiagnostics.currentSelectedModel,
+      lightweightPlanningModel: aiDiagnostics.lightweightPlanningModel,
+      fallbackModelSelected: aiDiagnostics.fallbackModelSelected,
+      verifiedAccessibleModels,
+      coolingDownModels,
+      lastSuccessfulModelRequest: lastSuccessAttr
+        ? {
+            modelId: lastSuccessAttr.modelUsed,
+            agent: lastSuccessAttr.agentType,
+            timestamp: lastSuccessAttr.timestampIso,
+            fallbackUsed: lastSuccessAttr.fallbackUsed,
+          }
+        : null,
+      lastFailureReason: lastFailedAttr?.errorReason || firstModelError,
+      recommendDemoMode: aiDiagnostics.recommendDemoMode,
+      aiServiceStatus: aiDiagnostics.aiServiceStatus,
+      aiDiagnostics,
+      modelRegistry,
+      models: modelRegistry,
+    });
+  });
+
+  app.post('/api/ai/models/verify', async (req: Request, res: Response) => {
+    try {
+      const nowMs = Date.now();
+      const forceFresh = Boolean(req.body?.force);
+      if (forceFresh && nowMs - lastManualVerifyMs < 15_000) {
+        const aiDiagnostics = requestManager.getDiagnostics(Boolean(apiKey));
+        const modelRegistry = requestManager.getModelRegistrySnapshot(
+          Boolean(apiKey),
+          PRIMARY_MODEL,
+          WEBSITE_FALLBACK_MODEL
+        );
+        return res.json({
+          status: 'ok',
+          throttled: true,
+          message: 'Model verification was run recently; returning current registry state.',
+          aiDiagnostics,
+          modelRegistry,
+          models: modelRegistry,
+        });
+      }
+      lastManualVerifyMs = nowMs;
+
+      const modelRegistry = await requestManager.verifyRuntimeModelsAccess({
+        apiKeyConfigured: Boolean(apiKey),
+        generateContent: (params) => generateContent(params),
+        cacheFilePath: !deps.generateContent ? modelVerificationCachePath : undefined,
+        forceFreshProbe: forceFresh,
+      });
+      const aiDiagnostics = requestManager.getDiagnostics(Boolean(apiKey));
+      const verifiedAccessibleModels = modelRegistry
+        .filter((m) => m.accessStatus === 'verified')
+        .map((m) => m.modelId);
+      const coolingDownModels = modelRegistry
+        .filter((m) => m.availabilityState === 'cooldown')
+        .map((m) => m.modelId);
+      return res.json({
+        status: 'ok',
+        throttled: false,
+        timestamp: new Date().toISOString(),
+        currentSelectedModel: aiDiagnostics.currentSelectedModel,
+        lightweightPlanningModel: aiDiagnostics.lightweightPlanningModel,
+        fallbackModelSelected: aiDiagnostics.fallbackModelSelected,
+        verifiedAccessibleModels,
+        coolingDownModels,
+        recommendDemoMode: aiDiagnostics.recommendDemoMode,
+        aiDiagnostics,
+        modelRegistry,
+        models: modelRegistry,
+      });
+    } catch (err) {
+      return res.status(500).json({
+        error: sanitizePublicErrorMessage(err, 'Failed to verify Gemini model access.'),
+      });
+    }
   });
 
   // ----------------------------------------------------
@@ -271,18 +421,22 @@ export function createWorkspaceApp(deps: WorkspaceAppDependencies = {}): Express
 
       if (!apiKey) {
         return res.status(503).json({
-          error: 'Gemini API key is not configured on the server. Please check the Secrets panel in AI Studio.',
+          code: 'API_KEY_MISSING',
+          demoModeAvailable: true,
+          error:
+            'Gemini API key is not configured on the server. Switch to Demo Mode or configure GEMINI_API_KEY.',
         });
       }
 
       const systemPrompt = `You are an expert Principal Software Engineer and System Architect.
-Your task is to generate a complete, high-quality, production-ready multi-file software project based on the user's specification.
+Your task is to generate a complete, high-quality, production-ready multi-file software project strictly in the requested programming language based on the user's specification.
 
 CRITICAL INSTRUCTIONS:
-1. Generate REAL, functional source code across MULTIPLE files. Never combine everything into a single file.
-2. Structure the files logically (e.g., config, entry points, business logic, models, controllers/routes, tests, README).
-3. Do NOT invent fake imports or rely on phantom packages. Ensure all dependencies match the chosen language and framework.
-4. Return ONLY a valid JSON object matching the requested schema. No conversational preamble, no markdown ticks around the JSON.`;
+1. STRICT LANGUAGE FIDELITY: Every source file, syntax construct, dependency manifest, and build script MUST strictly use the requested language (${language}) and framework (${framework}). NEVER output TypeScript/JavaScript or Python files when another language (such as Java, C++, C, Go, C#, or PHP) is requested.
+2. Generate REAL, functional source code across MULTIPLE files (e.g., Java -> *.java + pom.xml; C++ -> *.cpp/*.hpp + CMakeLists.txt; C -> *.c/*.h + Makefile; Python -> *.py + requirements.txt). Never combine everything into a single file.
+3. Structure the files logically (config, entry points, business logic, models, controllers/routes, tests, README).
+4. Do NOT invent fake imports or rely on phantom packages. Ensure all dependencies match the chosen language and framework.
+5. Return ONLY a valid JSON object matching the requested schema. No conversational preamble, no markdown ticks around the JSON.`;
 
       const userPrompt = `Project Name: ${projectName}
 Language: ${language}
@@ -309,28 +463,50 @@ Return a valid JSON object with the exact format:
   ]
 }`;
 
-      const response = await callWithBoundedRetry(() =>
-        generateContent({
-          model: PRIMARY_MODEL,
-          contents: userPrompt,
-          config: {
-            systemInstruction: systemPrompt,
-            responseMimeType: 'application/json',
-          },
-        })
-      );
+      const scopeKey = await resolveAiScopeKey(req);
+      const {
+        response,
+        cacheHit,
+        deduplicated,
+        modelUsed,
+        attemptedModels,
+        fallbackUsed,
+        modelFallbackNotice,
+      } = await requestManager.executeWithRouting({
+        agentType: 'code_generation',
+        scopeKey,
+        preferredModel: PRIMARY_MODEL,
+        contents: userPrompt,
+        config: {
+          systemInstruction: systemPrompt,
+          responseMimeType: 'application/json',
+        },
+        validateResponse: (rawText) => {
+          const parsedCheck = parseWebsiteGeneratorJson(rawText);
+          if (!parsedCheck.success) {
+            return { valid: false, reason: 'AI generated an invalid file structure.' };
+          }
+          const dataObj = parsedCheck.data as Record<string, any> | undefined;
+          return dataObj && Array.isArray(dataObj.files) && dataObj.files.length > 0
+            ? { valid: true }
+            : { valid: false, reason: 'AI generated an invalid file structure.' };
+        },
+        generateContent,
+      });
 
       const parsedResult = parseWebsiteGeneratorJson(response.text);
       if (!parsedResult.success || !parsedResult.data || typeof parsedResult.data !== 'object') {
         return res.status(502).json({
-          error: 'AI generated an invalid file structure. Please retry or adjust requirements.',
+          demoModeAvailable: true,
+          error: 'AI generated an invalid file structure. Please retry or switch to Demo Mode.',
         });
       }
 
       const parsed = parsedResult.data as Record<string, any>;
       if (!parsed.files || !Array.isArray(parsed.files) || parsed.files.length === 0) {
         return res.status(502).json({
-          error: 'AI generated an invalid file structure. Please retry or adjust requirements.',
+          demoModeAvailable: true,
+          error: 'AI generated an invalid file structure. Please retry or switch to Demo Mode.',
         });
       }
 
@@ -346,23 +522,29 @@ Return a valid JSON object with the exact format:
       return res.json({
         success: true,
         requestId: `req_code_${Date.now()}`,
+        executionMode: 'live',
+        modelUsed,
+        requestedModel: PRIMARY_MODEL,
+        attemptedModels,
+        fallbackUsed: Boolean(fallbackUsed),
+        ...(modelFallbackNotice ? { modelFallbackNotice } : {}),
+        cacheHit,
+        deduplicated,
         data: parsed,
       });
     } catch (error: any) {
       console.error('Error generating code:', sanitizePublicErrorMessage(error, 'Unknown error'));
-      const statusCode = getErrorStatusCode(error);
-      if (statusCode === 429) {
-        return res.status(429).json({
-          error: 'Gemini rate limit or quota exceeded. Please wait a moment before trying again.',
-        });
-      }
-      if (statusCode === 503) {
-        return res.status(503).json({
-          error: 'Gemini model is temporarily unavailable (HTTP 503). Please try again shortly.',
-        });
-      }
-      return res.status(500).json({
-        error: 'Failed to generate code project. Please retry.',
+      const normalized = normalizeGeminiError(error);
+      return res.status(normalized.status).json({
+        code: normalized.code,
+        ...(error?.attemptedModels ? { attemptedModels: error.attemptedModels } : {}),
+        ...(error?.allModelsExhausted ? { allModelsExhausted: true } : {}),
+        ...(error?.recommendDemoMode ? { recommendDemoMode: true } : {}),
+        demoModeAvailable: true,
+        ...(normalized.retryAfterSeconds
+          ? { retryAfterSeconds: normalized.retryAfterSeconds }
+          : {}),
+        error: normalized.message,
       });
     }
   });
@@ -388,18 +570,31 @@ Return a valid JSON object with the exact format:
 
       if (!apiKey) {
         return res.status(503).json({
+          code: 'API_KEY_MISSING',
+          demoModeAvailable: true,
           error: 'Gemini API key is not configured on the server.',
         });
       }
 
-      const filesManifest = files
-        .map(
-          (f: any, i: number) =>
-            `[File ${i + 1}: ${sanitizeManifestFilePath(f?.path || `file_${i}.txt`)}]\n\`\`\`${
-              f?.language || ''
-            }\n${String(f?.content || '').slice(0, 3000)}\n\`\`\``
-        )
-        .join('\n\n');
+      // Bound total prompt context size to stay well within free-tier TPM quotas
+      const MAX_TOTAL_CONTEXT_CHARS = 24_000;
+      const perFileBudget = Math.min(3000, Math.max(600, Math.floor(MAX_TOTAL_CONTEXT_CHARS / files.length)));
+      let remainingBudget = MAX_TOTAL_CONTEXT_CHARS;
+      const fileSections: string[] = [];
+
+      for (let i = 0; i < files.length; i++) {
+        if (remainingBudget <= 200) break;
+        const f = files[i];
+        const safePath = sanitizeManifestFilePath(f?.path || `file_${i}.txt`);
+        const sliceLen = Math.min(perFileBudget, remainingBudget);
+        const snippet = String(f?.content || '').slice(0, sliceLen);
+        remainingBudget -= snippet.length;
+        fileSections.push(
+          `[File ${i + 1}: ${safePath}]\n\`\`\`${f?.language || ''}\n${snippet}\n\`\`\``
+        );
+      }
+
+      const filesManifest = fileSections.join('\n\n');
 
       const systemPrompt = `You are a Principal Software Engineer performing a code modification on an existing project.
 The user wants to apply specific changes to the codebase.
@@ -431,20 +626,41 @@ Return JSON with exact shape:
   ]
 }`;
 
-      const response = await callWithBoundedRetry(() =>
-        generateContent({
-          model: PRIMARY_MODEL,
-          contents: userPrompt,
-          config: {
-            systemInstruction: systemPrompt,
-            responseMimeType: 'application/json',
-          },
-        })
-      );
+      const scopeKey = await resolveAiScopeKey(req);
+      const {
+        response,
+        cacheHit,
+        deduplicated,
+        modelUsed,
+        attemptedModels,
+        fallbackUsed,
+        modelFallbackNotice,
+      } = await requestManager.executeWithRouting({
+        agentType: 'code_modification',
+        scopeKey,
+        preferredModel: PRIMARY_MODEL,
+        contents: userPrompt,
+        config: {
+          systemInstruction: systemPrompt,
+          responseMimeType: 'application/json',
+        },
+        validateResponse: (rawText) => {
+          const parsedCheck = parseWebsiteGeneratorJson(rawText);
+          if (!parsedCheck.success) {
+            return { valid: false, reason: 'Invalid response from AI for code modification.' };
+          }
+          const dataObj = parsedCheck.data as Record<string, any> | undefined;
+          return dataObj && Array.isArray(dataObj.modifiedFiles)
+            ? { valid: true }
+            : { valid: false, reason: 'Invalid response from AI for code modification.' };
+        },
+        generateContent,
+      });
 
       const parsedResult = parseWebsiteGeneratorJson(response.text);
       if (!parsedResult.success || !parsedResult.data || typeof parsedResult.data !== 'object') {
         return res.status(502).json({
+          demoModeAvailable: true,
           error: 'Invalid response from AI for code modification.',
         });
       }
@@ -452,6 +668,7 @@ Return JSON with exact shape:
       const parsed = parsedResult.data as Record<string, any>;
       if (!parsed.modifiedFiles || !Array.isArray(parsed.modifiedFiles)) {
         return res.status(502).json({
+          demoModeAvailable: true,
           error: 'Invalid response from AI for code modification.',
         });
       }
@@ -464,23 +681,29 @@ Return JSON with exact shape:
       return res.json({
         success: true,
         requestId: `req_mod_${Date.now()}`,
+        executionMode: 'live',
+        modelUsed,
+        requestedModel: PRIMARY_MODEL,
+        attemptedModels,
+        fallbackUsed: Boolean(fallbackUsed),
+        ...(modelFallbackNotice ? { modelFallbackNotice } : {}),
+        cacheHit,
+        deduplicated,
         data: parsed,
       });
     } catch (error: any) {
       console.error('Error modifying code:', sanitizePublicErrorMessage(error, 'Unknown error'));
-      const statusCode = getErrorStatusCode(error);
-      if (statusCode === 429) {
-        return res.status(429).json({
-          error: 'Gemini rate limit or quota exceeded. Please wait a moment.',
-        });
-      }
-      if (statusCode === 503) {
-        return res.status(503).json({
-          error: 'Gemini model is temporarily unavailable (HTTP 503). Please try again shortly.',
-        });
-      }
-      return res.status(500).json({
-        error: 'Failed to modify code project. Please retry.',
+      const normalized = normalizeGeminiError(error);
+      return res.status(normalized.status).json({
+        code: normalized.code,
+        ...(error?.attemptedModels ? { attemptedModels: error.attemptedModels } : {}),
+        ...(error?.allModelsExhausted ? { allModelsExhausted: true } : {}),
+        ...(error?.recommendDemoMode ? { recommendDemoMode: true } : {}),
+        demoModeAvailable: true,
+        ...(normalized.retryAfterSeconds
+          ? { retryAfterSeconds: normalized.retryAfterSeconds }
+          : {}),
+        error: normalized.message,
       });
     }
   });
@@ -509,6 +732,7 @@ Return JSON with exact shape:
         });
       }
 
+      const scopeKey = await resolveAiScopeKey(req);
       const { status, body } = await executeWebsiteGeneration({
         input: {
           websiteName: String(websiteName),
@@ -521,13 +745,17 @@ Return JSON with exact shape:
         apiKeyConfigured: Boolean(apiKey),
         model: WEBSITE_GENERATOR_MODEL,
         fallbackModel: WEBSITE_FALLBACK_MODEL,
+        useModelRouter: true,
         generateContent: (params) => generateContent(params),
+        requestManager,
+        scopeKey,
       });
 
       return res.status(status).json(body);
     } catch (error: any) {
       console.error('Error generating website:', sanitizePublicErrorMessage(error, 'Unknown error'));
       return res.status(500).json({
+        demoModeAvailable: true,
         error: 'Failed to generate website due to an unexpected server error.',
       });
     }
@@ -698,7 +926,10 @@ Return JSON with exact shape:
 
       if (!apiKey) {
         return res.status(503).json({
-          error: 'Gemini API key is not configured on the server.',
+          code: 'API_KEY_MISSING',
+          demoModeAvailable: true,
+          error:
+            'Gemini API key is not configured on the server. Switch to Demo Mode or configure GEMINI_API_KEY.',
         });
       }
 
@@ -758,34 +989,64 @@ Return ONLY a valid JSON object with the exact structure:
   "fullMarkdown": "Complete formatted Markdown document with ## Sections, ### Subsections, paragraphs, bullet/numbered lists, and Markdown tables (| Col1 | Col2 |)."
 }`;
 
-      const response = await callWithBoundedRetry(() =>
-        generateContent({
-          model: PRIMARY_MODEL,
-          contents: userPrompt,
-          config: {
-            systemInstruction: systemPrompt,
-            responseMimeType: 'application/json',
-          },
-        })
-      );
+      const scopeKey = await resolveAiScopeKey(req);
+      const {
+        response,
+        cacheHit,
+        deduplicated,
+        modelUsed,
+        attemptedModels,
+        fallbackUsed,
+        modelFallbackNotice,
+      } = await requestManager.executeWithRouting({
+        agentType: 'document_generation',
+        scopeKey,
+        preferredModel: PRIMARY_MODEL,
+        contents: userPrompt,
+        config: {
+          systemInstruction: systemPrompt,
+          responseMimeType: 'application/json',
+        },
+        validateResponse: (rawText) => {
+          const parsedCheck = parseWebsiteGeneratorJson(rawText);
+          if (!parsedCheck.success) {
+            return { valid: false, reason: 'AI generated invalid document structure.' };
+          }
+          const dataObj = parsedCheck.data as Record<string, any> | undefined;
+          return dataObj && Array.isArray(dataObj.sections)
+            ? { valid: true }
+            : { valid: false, reason: 'AI generated invalid document structure.' };
+        },
+        generateContent,
+      });
 
       const parsedResult = parseWebsiteGeneratorJson(response.text);
       if (!parsedResult.success || !parsedResult.data || typeof parsedResult.data !== 'object') {
         return res.status(502).json({
-          error: 'AI generated invalid document structure. Please retry.',
+          demoModeAvailable: true,
+          error: 'AI generated invalid document structure. Please retry or switch to Demo Mode.',
         });
       }
 
       const parsed = parsedResult.data as Record<string, any>;
       if (!parsed.sections || !Array.isArray(parsed.sections)) {
         return res.status(502).json({
-          error: 'AI generated invalid document structure. Please retry.',
+          demoModeAvailable: true,
+          error: 'AI generated invalid document structure. Please retry or switch to Demo Mode.',
         });
       }
 
       return res.json({
         success: true,
         requestId: `req_doc_${Date.now()}`,
+        executionMode: 'live',
+        modelUsed,
+        requestedModel: PRIMARY_MODEL,
+        attemptedModels,
+        fallbackUsed: Boolean(fallbackUsed),
+        ...(modelFallbackNotice ? { modelFallbackNotice } : {}),
+        cacheHit,
+        deduplicated,
         data: parsed,
       });
     } catch (error: any) {
@@ -793,19 +1054,17 @@ Return ONLY a valid JSON object with the exact structure:
         'Error generating document:',
         sanitizePublicErrorMessage(error, 'Unknown error')
       );
-      const statusCode = getErrorStatusCode(error);
-      if (statusCode === 429) {
-        return res.status(429).json({
-          error: 'Gemini quota or rate limit exceeded. Please wait a moment.',
-        });
-      }
-      if (statusCode === 503) {
-        return res.status(503).json({
-          error: 'Gemini model is temporarily unavailable (HTTP 503). Please try again shortly.',
-        });
-      }
-      return res.status(500).json({
-        error: 'Failed to generate document. Please retry.',
+      const normalized = normalizeGeminiError(error);
+      return res.status(normalized.status).json({
+        code: normalized.code,
+        ...(error?.attemptedModels ? { attemptedModels: error.attemptedModels } : {}),
+        ...(error?.allModelsExhausted ? { allModelsExhausted: true } : {}),
+        ...(error?.recommendDemoMode ? { recommendDemoMode: true } : {}),
+        demoModeAvailable: true,
+        ...(normalized.retryAfterSeconds
+          ? { retryAfterSeconds: normalized.retryAfterSeconds }
+          : {}),
+        error: normalized.message,
       });
     }
   });
@@ -823,14 +1082,18 @@ Return ONLY a valid JSON object with the exact structure:
         });
       }
 
+      const scopeKey = await resolveAiScopeKey(req);
       const { status, body } = await executeDataCleaningPlanRequest({
         input: {
           instruction: String(instruction),
           datasetProfile,
         },
         apiKeyConfigured: Boolean(apiKey),
-        model: PRIMARY_MODEL,
+        model: 'gemini-3.1-flash-lite',
+        useModelRouter: true,
         generateContent: (params) => generateContent(params),
+        requestManager,
+        scopeKey,
       });
 
       return res.status(status).json(body);
@@ -840,7 +1103,8 @@ Return ONLY a valid JSON object with the exact structure:
         sanitizePublicErrorMessage(error, 'Unknown error')
       );
       return res.status(500).json({
-        error: 'Failed to plan data cleaning operations. Please retry.',
+        demoModeAvailable: true,
+        error: 'Failed to plan data cleaning operations. Please retry or switch to Demo Mode.',
       });
     }
   });
@@ -852,9 +1116,36 @@ Return ONLY a valid JSON object with the exact structure:
 // Production vs Development Serving
 // ----------------------------------------------------
 async function startServer() {
-  const app = createWorkspaceApp();
+  const startupRequestManager = new GeminiRequestManager();
+  const apiKey = process.env.GEMINI_API_KEY || '';
+  const startupAi = apiKey
+    ? new GoogleGenAI({
+        apiKey,
+        httpOptions: {
+          headers: {
+            'User-Agent': 'aistudio-build',
+          },
+        },
+      })
+    : null;
+
+  const app = createWorkspaceApp({
+    requestManager: startupRequestManager,
+  });
   const isProduction = process.env.NODE_ENV === 'production';
   const PORT = Number(process.env.PORT) || 3000;
+
+  // Safe non-blocking startup model capability check (uses 30-min cache or minimal 1-call probe)
+  if (startupAi) {
+    const cacheFilePath = path.resolve(__dirname, '.local-data', 'model-verification-cache.json');
+    void startupRequestManager
+      .verifyRuntimeModelsAccess({
+        apiKeyConfigured: true,
+        generateContent: (params) => startupAi.models.generateContent(params),
+        cacheFilePath,
+      })
+      .catch(() => {});
+  }
 
   if (isProduction) {
     const otpSecurity = getOtpSecurityStatus();

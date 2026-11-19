@@ -13,11 +13,20 @@ import {
   buildDatasetProfileForAi,
   calculateDatasetStats,
   executeCleaningPipeline,
+  isMissingValue,
   DatasetStats,
   CleaningOperation,
   CleaningResult,
+  MissingValueConfig,
+  AuditEntryStatus,
 } from '../../utils/dataCleaner';
 import { parseTabularFile, exportToCsv, exportToXlsx } from '../../utils/sheetExport';
+import {
+  AgentExecutionMode,
+  interpretDemoCleaningInstruction,
+} from '../../utils/demoModeEngine';
+import { getAiRequestHeaders, parseAiFailure, ParsedAiErrorInfo } from '../../lib/aiClient';
+import { AgentModeBar, AiUnavailableBanner } from '../../components/common/AgentModeControls';
 import {
   Table2,
   Upload,
@@ -32,6 +41,11 @@ import {
   RotateCcw,
   HelpCircle,
   X,
+  ClipboardList,
+  Filter,
+  FileText,
+  Trash2,
+  Columns,
 } from 'lucide-react';
 
 // Sample dataset with realistic quality issues (duplicates, whitespace, missing values, mixed dates, inconsistent categories)
@@ -52,6 +66,19 @@ interface CleaningPlanFeedback {
   status: 'needs_clarification' | 'invalid_column';
   explanation: string;
   clarificationQuestion: string;
+  pendingColumnRemovalCount?: number;
+}
+
+function triggerClientDownload(filename: string, content: string, mimeType: string) {
+  const blob = new Blob([content], { type: mimeType });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement('a');
+  link.href = url;
+  link.download = filename;
+  document.body.appendChild(link);
+  link.click();
+  document.body.removeChild(link);
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 
 export const DataCleanerPage: React.FC = () => {
@@ -70,31 +97,60 @@ export const DataCleanerPage: React.FC = () => {
   const [cleanedData, setCleanedData] = useState<Record<string, any>[] | null>(null);
   const [datasetFormat, setDatasetFormat] = useState<'csv' | 'xlsx'>('csv');
 
-  // View & Pagination
-  const [activeTab, setActiveTab] = useState<'original' | 'cleaned'>('original');
+  // Missing-value token configuration ("NA"/"N/A" NOT treated as missing unless explicitly enabled)
+  const [treatNATokensAsMissing, setTreatNATokensAsMissing] = useState(false);
+  const missingConfig: MissingValueConfig = useMemo(
+    () => ({
+      treatWhitespaceAsMissing: true,
+      treatNATokensAsMissing,
+    }),
+    [treatNATokensAsMissing]
+  );
+
+  // View & Pagination (Row AND Column windowing to handle 1,105 x 1,005 cleanly)
+  const [activeTab, setActiveTab] = useState<'original' | 'cleaned' | 'compare'>('original');
   const [currentPage, setCurrentPage] = useState(1);
   const pageSize = 8;
+  const [colPage, setColPage] = useState(1);
+  const colPageSize = 18;
+  const [colFilterQuery, setColFilterQuery] = useState('');
 
   // Natural-Language Instruction & Execution State
+  const [executionMode, setExecutionMode] = useState<AgentExecutionMode>('live');
   const [instruction, setInstruction] = useState('');
   const [isPlanning, setIsPlanning] = useState(false);
+  const planningRef = useRef(false);
   const [appliedStepsHistory, setAppliedStepsHistory] = useState<CleaningOperation[]>([]);
   const [cleaningResult, setCleaningResult] = useState<CleaningResult | null>(null);
   const [planExplanation, setPlanExplanation] = useState<string | null>(null);
+  const [lastPlanMode, setLastPlanMode] = useState<AgentExecutionMode>('live');
   const [clarificationFeedback, setClarificationFeedback] = useState<CleaningPlanFeedback | null>(null);
+
+  // Interactive Multi-Column Removal Confirmation Picker
+  const [selectedRemovalCols, setSelectedRemovalCols] = useState<string[]>([]);
+  const [pickerSearchQuery, setPickerSearchQuery] = useState('');
+
+  // Cleaning Activity Report Filters
+  const [auditOpFilter, setAuditOpFilter] = useState<string>('ALL');
+  const [auditStatusFilter, setAuditStatusFilter] = useState<'ALL' | AuditEntryStatus>('ALL');
+  const [auditColFilter, setAuditColFilter] = useState<string>('');
+  const [auditRowFilter, setAuditRowFilter] = useState<string>('');
+  const [auditPage, setAuditPage] = useState(1);
+  const auditPageSize = 15;
 
   // Status & Error
   const [statusMessage, setStatusMessage] = useState<string | null>(null);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  const [aiUnavailableError, setAiUnavailableError] = useState<ParsedAiErrorInfo | null>(null);
 
-  // Memoized dataset stats (important for responsiveness on large datasets)
+  // Memoized dataset stats
   const originalStats: DatasetStats = useMemo(
-    () => calculateDatasetStats(originalData),
-    [originalData]
+    () => calculateDatasetStats(originalData, missingConfig),
+    [originalData, missingConfig]
   );
   const cleanedStats: DatasetStats | null = useMemo(
-    () => (cleanedData ? calculateDatasetStats(cleanedData) : null),
-    [cleanedData]
+    () => (cleanedData ? calculateDatasetStats(cleanedData, missingConfig) : null),
+    [cleanedData, missingConfig]
   );
 
   // Load dataset if query param exists
@@ -117,6 +173,7 @@ export const DataCleanerPage: React.FC = () => {
           setAppliedStepsHistory([]);
           setPlanExplanation(null);
           setClarificationFeedback(null);
+          setColPage(1);
         }
       } catch (err) {
         console.warn('Could not load dataset:', err);
@@ -132,6 +189,7 @@ export const DataCleanerPage: React.FC = () => {
 
     setErrorMessage(null);
     setClarificationFeedback(null);
+    setSelectedRemovalCols([]);
     setStatusMessage('Reading file into memory...');
 
     const parsed = await parseTabularFile(file);
@@ -149,12 +207,14 @@ export const DataCleanerPage: React.FC = () => {
     setAppliedStepsHistory([]);
     setPlanExplanation(null);
     setCurrentPage(1);
+    setColPage(1);
+    setColFilterQuery('');
     setActiveTab('original');
     setStatusMessage(`Loaded ${parsed.data.length} rows across ${parsed.columns.length} columns.`);
 
     const ownerUid = currentUser?.uid || 'guest_engineer_demo';
     const newDatasetId = `data_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`;
-    const stats = calculateDatasetStats(parsed.data);
+    const stats = calculateDatasetStats(parsed.data, missingConfig);
     const now = new Date().toISOString();
 
     setActiveDatasetId(newDatasetId);
@@ -169,7 +229,7 @@ export const DataCleanerPage: React.FC = () => {
       rowCount: stats.rowCount,
       columnCount: stats.columnCount,
       columns: stats.columns,
-      previewData: parsed.data.slice(0, 100),
+      previewData: parsed.data,
       createdAt: now,
       updatedAt: now,
     };
@@ -179,7 +239,7 @@ export const DataCleanerPage: React.FC = () => {
       await logActivity(
         ownerUid,
         'dataset',
-        `Uploaded dataset '${parsed.filename}' (${stats.rowCount} rows)`,
+        `Uploaded dataset '${parsed.filename}' (${stats.rowCount} rows, ${stats.columnCount} columns)`,
         newDatasetId,
         'dataset'
       );
@@ -193,6 +253,7 @@ export const DataCleanerPage: React.FC = () => {
     const sampleFilename = 'customers_dirty_sample.csv';
     setErrorMessage(null);
     setClarificationFeedback(null);
+    setSelectedRemovalCols([]);
     setOriginalData(DIRTY_SAMPLE_DATA);
     setFilename(sampleFilename);
     setDatasetFormat('csv');
@@ -201,6 +262,8 @@ export const DataCleanerPage: React.FC = () => {
     setAppliedStepsHistory([]);
     setPlanExplanation(null);
     setCurrentPage(1);
+    setColPage(1);
+    setColFilterQuery('');
     setActiveTab('original');
     setStatusMessage(
       'Loaded sample dataset with duplicates, whitespace, mixed dates, missing values, and inconsistent categories.'
@@ -208,7 +271,7 @@ export const DataCleanerPage: React.FC = () => {
 
     const ownerUid = currentUser?.uid || 'guest_engineer_demo';
     const newDatasetId = `data_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`;
-    const stats = calculateDatasetStats(DIRTY_SAMPLE_DATA);
+    const stats = calculateDatasetStats(DIRTY_SAMPLE_DATA, missingConfig);
     const now = new Date().toISOString();
 
     setActiveDatasetId(newDatasetId);
@@ -249,15 +312,168 @@ export const DataCleanerPage: React.FC = () => {
     setAppliedStepsHistory([]);
     setPlanExplanation(null);
     setClarificationFeedback(null);
+    setSelectedRemovalCols([]);
     setErrorMessage(null);
     setActiveTab('original');
     setCurrentPage(1);
+    setColPage(1);
     setStatusMessage('Restored view to the untouched original dataset.');
   };
 
-  // Execute Natural-Language Cleaning Request
-  const handleRunCleaning = async (e: React.FormEvent) => {
-    e.preventDefault();
+  // Apply validated cleaning plan deterministically in-memory without mutating originalData
+  const applyPlannedCleaningOperations = async (
+    trimmedInstruction: string,
+    workingSourceData: Record<string, any>[],
+    workingStats: DatasetStats,
+    plan: {
+      status: string;
+      explanation?: string;
+      clarificationQuestion?: string;
+      pendingColumnRemovalCount?: number;
+      operations?: CleaningOperation[];
+    },
+    planMode: AgentExecutionMode
+  ) => {
+    if (plan.status !== 'ready') {
+      setSelectedRemovalCols([]);
+      setPickerSearchQuery('');
+      setClarificationFeedback({
+        status: plan.status === 'invalid_column' ? 'invalid_column' : 'needs_clarification',
+        explanation: plan.explanation || 'More detail is needed before modifying the dataset.',
+        clarificationQuestion:
+          plan.clarificationQuestion ||
+          `Please specify a valid column (${workingStats.columns.slice(0, 12).join(', ')}${
+            workingStats.columns.length > 12 ? ', ...' : ''
+          }) and exact cleaning rule.`,
+        pendingColumnRemovalCount: plan.pendingColumnRemovalCount,
+      });
+      return;
+    }
+
+    const plannedOps: CleaningOperation[] = plan.operations || [];
+    if (plannedOps.length === 0) {
+      setClarificationFeedback({
+        status: 'needs_clarification',
+        explanation: 'No deterministic operations were matched from your prompt.',
+        clarificationQuestion:
+          'Please specify what you want cleaned (for example: "Replace all missing values with 0" or "Remove duplicate rows").',
+      });
+      return;
+    }
+
+    // Yield briefly to keep UI responsive before processing large datasets locally
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    // Execute sequentially on a shallow clone in-memory without mutating originalData
+    const result = executeCleaningPipeline(workingSourceData, plannedOps, missingConfig);
+    setCleanedData(result.cleanedData);
+    setCleaningResult(result);
+    setLastPlanMode(planMode);
+    setPlanExplanation(
+      planMode === 'demo'
+        ? `[Demo Mode · Local Interpreter] ${plan.explanation || 'Completed requested local cleaning operations.'}`
+        : plan.explanation || null
+    );
+    setAppliedStepsHistory((prev) => [...prev, ...plannedOps]);
+    setAuditOpFilter('ALL');
+    setAuditStatusFilter('ALL');
+    setAuditColFilter('');
+    setAuditRowFilter('');
+    setAuditPage(1);
+    setActiveTab('cleaned');
+    setCurrentPage(1);
+    setColPage(1);
+    setStatusMessage(
+      planMode === 'demo'
+        ? `[Demo Mode] Executed ${result.operationsCompleted} local operation${
+            result.operationsCompleted === 1 ? '' : 's'
+          } (${result.cellsModified} cells modified, ${result.rowsRemoved} rows removed) without calling Gemini API.`
+        : `Executed ${result.operationsCompleted} requested operation${
+            result.operationsCompleted === 1 ? '' : 's'
+          } cleanly (${result.cellsModified} cells modified).`
+    );
+
+    // Persist cleaning history & dataset metadata to Firestore
+    const ownerUid = currentUser?.uid || 'guest_engineer_demo';
+    const cleanedStatsNow = result.statsAfter;
+    const now = new Date().toISOString();
+    const targetDatasetId =
+      activeDatasetId || `data_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`;
+    const preservedCreatedAt = activeDatasetCreatedAt || now;
+    const nextCleanedCount = cleanedVersionsCount + 1;
+
+    if (!activeDatasetId) {
+      setActiveDatasetId(targetDatasetId);
+      setActiveDatasetCreatedAt(preservedCreatedAt);
+    }
+    setCleanedVersionsCount(nextCleanedCount);
+
+    try {
+      if (activeDatasetId) {
+        await updateDataset(targetDatasetId, {
+          filename,
+          format: datasetFormat,
+          rowCount: cleanedStatsNow.rowCount,
+          columnCount: cleanedStatsNow.columnCount,
+          columns: cleanedStatsNow.columns,
+          previewData: result.cleanedData,
+          cleanedVersionsCount: nextCleanedCount,
+        });
+      } else {
+        const record: DatasetRecord = {
+          id: targetDatasetId,
+          ownerId: ownerUid,
+          filename,
+          format: datasetFormat,
+          rowCount: cleanedStatsNow.rowCount,
+          columnCount: cleanedStatsNow.columnCount,
+          columns: cleanedStatsNow.columns,
+          previewData: result.cleanedData,
+          cleanedVersionsCount: nextCleanedCount,
+          createdAt: preservedCreatedAt,
+          updatedAt: now,
+        };
+        await saveDataset(record);
+      }
+
+      const jobId = `job_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`;
+      await saveCleaningJob({
+        id: jobId,
+        ownerId: ownerUid,
+        datasetId: targetDatasetId,
+        operations: plannedOps.map((op) => ({
+          id: op.id,
+          type: op.type,
+          params: op.params,
+          description: op.description,
+        })),
+        stats: {
+          originalRows: originalData.length,
+          cleanedRows: cleanedStatsNow.rowCount,
+          rowsRemoved: result.rowsRemoved,
+          duplicatesRemoved: result.duplicatesRemoved,
+          missingValuesHandled: result.missingValuesHandled,
+          columnsModified: result.columnsModified,
+        },
+        createdAt: now,
+        updatedAt: now,
+      });
+
+      await logActivity(
+        ownerUid,
+        'dataset',
+        `${planMode === 'demo' ? '[Demo Mode] ' : ''}Cleaned '${filename}' via prompt: "${trimmedInstruction.slice(0, 80)}"`,
+        targetDatasetId,
+        'dataset'
+      );
+    } catch (persistErr) {
+      console.warn('Could not persist cleaned dataset record:', persistErr);
+    }
+  };
+
+  // Execute Natural-Language Cleaning Request (Live AI or Offline Demo Mode)
+  const executeCleaningWithMode = async (targetMode: AgentExecutionMode) => {
+    if (planningRef.current) return;
     const trimmedInstruction = instruction.trim();
     if (!trimmedInstruction) {
       setErrorMessage('Please enter a cleaning instruction describing what you want to change.');
@@ -272,13 +488,15 @@ export const DataCleanerPage: React.FC = () => {
       return;
     }
 
+    planningRef.current = true;
     setErrorMessage(null);
+    setAiUnavailableError(null);
     setStatusMessage(null);
     setClarificationFeedback(null);
+    setSelectedRemovalCols([]);
     setIsPlanning(true);
 
     try {
-      // Only send metadata + up to 6 representative rows so large datasets remain fast & within payload bounds
       const datasetProfile = buildDatasetProfileForAi(
         workingSourceData,
         filename,
@@ -286,156 +504,223 @@ export const DataCleanerPage: React.FC = () => {
         workingStats
       );
 
+      if (targetMode === 'demo') {
+        const demoPlan = interpretDemoCleaningInstruction(trimmedInstruction, datasetProfile);
+        await applyPlannedCleaningOperations(
+          trimmedInstruction,
+          workingSourceData,
+          workingStats,
+          demoPlan,
+          'demo'
+        );
+        return;
+      }
+
+      const headers = await getAiRequestHeaders();
       const response = await fetch('/api/ai/plan-cleaning', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers,
         body: JSON.stringify({
           instruction: trimmedInstruction,
           datasetProfile,
         }),
       });
 
-      const payload = await response.json();
+      const payload = await response.json().catch(() => null);
       if (!response.ok) {
-        throw new Error(payload.error || 'Failed to interpret cleaning instruction.');
+        const parsedErr = parseAiFailure(
+          response.status,
+          payload,
+          'Failed to interpret cleaning instruction.'
+        );
+        if (parsedErr.isQuotaOrTransient) {
+          setAiUnavailableError(parsedErr);
+          if (parsedErr.allModelsExhausted || parsedErr.recommendDemoMode) {
+            setExecutionMode('demo');
+          }
+        } else {
+          setErrorMessage(parsedErr.message);
+        }
+        return;
       }
 
-      const plan = payload.plan;
+      const plan = payload?.plan;
       if (!plan) {
         throw new Error('Server returned an incomplete cleaning plan.');
       }
 
-      if (plan.status !== 'ready') {
-        // Ask user for clarification or column correction without altering data
-        setClarificationFeedback({
-          status: plan.status === 'invalid_column' ? 'invalid_column' : 'needs_clarification',
-          explanation: plan.explanation || 'More detail is needed before modifying the dataset.',
-          clarificationQuestion:
-            plan.clarificationQuestion ||
-            `Please specify a valid column (${workingStats.columns.join(', ')}) and exact cleaning rule.`,
-        });
-        return;
-      }
-
-      const plannedOps: CleaningOperation[] = plan.operations || [];
-      if (plannedOps.length === 0) {
-        setClarificationFeedback({
-          status: 'needs_clarification',
-          explanation: 'No deterministic operations were matched from your prompt.',
-          clarificationQuestion:
-            'Please specify what you want cleaned (for example: "Remove duplicate rows" or "Trim whitespace from all text columns").',
-        });
-        return;
-      }
-
-      // Yield briefly to keep UI responsive before processing large datasets locally
-      await new Promise((resolve) => setTimeout(resolve, 0));
-
-      // Execute deterministically in-memory without mutating originalData
-      const result = executeCleaningPipeline(workingSourceData, plannedOps);
-      setCleanedData(result.cleanedData);
-      setCleaningResult(result);
-      setPlanExplanation(plan.explanation || null);
-      setAppliedStepsHistory((prev) => [...prev, ...plannedOps]);
-      setActiveTab('cleaned');
-      setCurrentPage(1);
-      setStatusMessage(
-        `Applied ${plannedOps.length} requested operation${plannedOps.length === 1 ? '' : 's'} cleanly.`
+      await applyPlannedCleaningOperations(
+        trimmedInstruction,
+        workingSourceData,
+        workingStats,
+        plan,
+        'live'
       );
-
-      // Persist cleaning history & dataset metadata to Firestore
-      const ownerUid = currentUser?.uid || 'guest_engineer_demo';
-      const cleanedStatsNow = result.statsAfter;
-      const now = new Date().toISOString();
-      const targetDatasetId =
-        activeDatasetId || `data_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`;
-      const preservedCreatedAt = activeDatasetCreatedAt || now;
-      const nextCleanedCount = cleanedVersionsCount + 1;
-
-      if (!activeDatasetId) {
-        setActiveDatasetId(targetDatasetId);
-        setActiveDatasetCreatedAt(preservedCreatedAt);
-      }
-      setCleanedVersionsCount(nextCleanedCount);
-
-      try {
-        if (activeDatasetId) {
-          await updateDataset(targetDatasetId, {
-            filename,
-            format: datasetFormat,
-            rowCount: cleanedStatsNow.rowCount,
-            columnCount: cleanedStatsNow.columnCount,
-            columns: cleanedStatsNow.columns,
-            previewData: result.cleanedData.slice(0, 100),
-            cleanedVersionsCount: nextCleanedCount,
-          });
-        } else {
-          const record: DatasetRecord = {
-            id: targetDatasetId,
-            ownerId: ownerUid,
-            filename,
-            format: datasetFormat,
-            rowCount: cleanedStatsNow.rowCount,
-            columnCount: cleanedStatsNow.columnCount,
-            columns: cleanedStatsNow.columns,
-            previewData: result.cleanedData.slice(0, 100),
-            cleanedVersionsCount: nextCleanedCount,
-            createdAt: preservedCreatedAt,
-            updatedAt: now,
-          };
-          await saveDataset(record);
-        }
-
-        const jobId = `job_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`;
-        await saveCleaningJob({
-          id: jobId,
-          ownerId: ownerUid,
-          datasetId: targetDatasetId,
-          operations: plannedOps.map((op) => ({
-            id: op.id,
-            type: op.type,
-            params: op.params,
-            description: op.description,
-          })),
-          stats: {
-            originalRows: originalData.length,
-            cleanedRows: cleanedStatsNow.rowCount,
-            rowsRemoved: result.rowsRemoved,
-            duplicatesRemoved: result.duplicatesRemoved,
-            missingValuesHandled: result.missingValuesHandled,
-            columnsModified: result.columnsModified,
-          },
-          createdAt: now,
-          updatedAt: now,
-        });
-
-        await logActivity(
-          ownerUid,
-          'dataset',
-          `Cleaned '${filename}' via prompt: "${trimmedInstruction.slice(0, 80)}"`,
-          targetDatasetId,
-          'dataset'
-        );
-      } catch (persistErr) {
-        console.warn('Could not persist cleaned dataset record:', persistErr);
-      }
     } catch (err: any) {
       setErrorMessage(err.message || 'Could not process the cleaning instruction.');
     } finally {
+      planningRef.current = false;
       setIsPlanning(false);
     }
   };
 
-  // Table pagination
-  const currentTableData = activeTab === 'cleaned' && cleanedData ? cleanedData : originalData;
+  const handleConfirmPendingColumnRemoval = async () => {
+    if (selectedRemovalCols.length === 0) return;
+    const workingSourceData = cleanedData ?? originalData;
+    const workingStats = cleanedStats ?? originalStats;
+    const confirmedOp: CleaningOperation = {
+      id: `confirmed_drop_${Date.now()}`,
+      type: 'remove_column',
+      params: { columns: selectedRemovalCols },
+      description: `Remove ${selectedRemovalCols.length} confirmed column(s): ${selectedRemovalCols.join(', ')}`,
+    };
+    setClarificationFeedback(null);
+    await applyPlannedCleaningOperations(
+      `Remove columns: ${selectedRemovalCols.join(', ')}`,
+      workingSourceData,
+      workingStats,
+      {
+        status: 'ready',
+        explanation: `Removed ${selectedRemovalCols.length} confirmed column(s): ${selectedRemovalCols.join(', ')}.`,
+        operations: [confirmedOp],
+      },
+      executionMode
+    );
+    setSelectedRemovalCols([]);
+  };
+
+  const handleRunCleaning = async (e: React.FormEvent) => {
+    e.preventDefault();
+    await executeCleaningWithMode(executionMode);
+  };
+
+  // Filtered & paginated Audit Log for Cleaning Activity Report
+  const availableAuditOperations = useMemo(() => {
+    if (!cleaningResult) return [];
+    return Array.from(new Set(cleaningResult.auditLog.map((entry) => entry.operationLabel)));
+  }, [cleaningResult]);
+
+  const filteredAuditLog = useMemo(() => {
+    if (!cleaningResult) return [];
+    const colQ = auditColFilter.trim().toLowerCase();
+    const rowQ = auditRowFilter.trim();
+    return cleaningResult.auditLog.filter((entry) => {
+      if (auditOpFilter !== 'ALL' && entry.operationLabel !== auditOpFilter) return false;
+      if (auditStatusFilter !== 'ALL' && entry.status !== auditStatusFilter) return false;
+      if (colQ && !entry.column.toLowerCase().includes(colQ)) return false;
+      if (rowQ) {
+        const rowStr = entry.originalRow !== null ? String(entry.originalRow) : '';
+        if (rowStr !== rowQ) return false;
+      }
+      return true;
+    });
+  }, [cleaningResult, auditOpFilter, auditStatusFilter, auditColFilter, auditRowFilter]);
+
+  const totalAuditPages = Math.max(1, Math.ceil(filteredAuditLog.length / auditPageSize));
+  const paginatedAuditLog = filteredAuditLog.slice(
+    (auditPage - 1) * auditPageSize,
+    auditPage * auditPageSize
+  );
+
+  // Download Cleaning Report as CSV or JSON
+  const handleDownloadAuditCsv = () => {
+    if (!cleaningResult) return;
+    const headers = [
+      'Original Row',
+      'Column',
+      'Previous Value',
+      'New Value',
+      'Operation',
+      'Reason',
+      'Status',
+    ];
+    const escapeCell = (v: any) => {
+      const s = String(v ?? '');
+      return /[",\n\r]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+    };
+    const rows = cleaningResult.auditLog.map((item) =>
+      [
+        item.originalRow ?? 'schema',
+        item.column,
+        item.previousValue,
+        item.newValue,
+        item.operationLabel,
+        item.reason,
+        item.status,
+      ]
+        .map(escapeCell)
+        .join(',')
+    );
+    const csv = [headers.join(','), ...rows].join('\n');
+    const baseName = filename.replace(/\.(csv|xlsx|xls)$/i, '');
+    triggerClientDownload(`${baseName}_cleaning_report.csv`, csv, 'text/csv;charset=utf-8;');
+  };
+
+  const handleDownloadAuditJson = () => {
+    if (!cleaningResult) return;
+    const report = {
+      filename,
+      generatedAt: new Date().toISOString(),
+      executionMode: lastPlanMode,
+      summary: {
+        rowsBefore: cleaningResult.statsBefore.rowCount,
+        rowsAfter: cleaningResult.statsAfter.rowCount,
+        columnsBefore: cleaningResult.statsBefore.columnCount,
+        columnsAfter: cleaningResult.statsAfter.columnCount,
+        missingBefore: cleaningResult.statsBefore.totalMissingValues,
+        missingAfter: cleaningResult.statsAfter.totalMissingValues,
+        duplicatesRemoved: cleaningResult.duplicatesRemoved,
+        cellsModified: cleaningResult.cellsModified,
+        rowsRemoved: cleaningResult.rowsRemoved,
+        columnsRemoved: cleaningResult.columnsRemoved,
+        operationsCompleted: cleaningResult.operationsCompleted,
+        operationsFailed: cleaningResult.operationsFailed,
+      },
+      operationSummaries: cleaningResult.operationSummaries,
+      auditLogTruncated: cleaningResult.auditLogTruncated,
+      totalAuditEvents: cleaningResult.totalAuditEvents,
+      auditLog: cleaningResult.auditLog,
+    };
+    const baseName = filename.replace(/\.(csv|xlsx|xls)$/i, '');
+    triggerClientDownload(
+      `${baseName}_cleaning_report.json`,
+      JSON.stringify(report, null, 2),
+      'application/json;charset=utf-8;'
+    );
+  };
+
+  // Table pagination (rows + columns)
+  const workingActiveStats =
+    activeTab !== 'original' && cleanedStats ? cleanedStats : originalStats;
+  const currentTableData =
+    activeTab !== 'original' && cleanedData ? cleanedData : originalData;
   const totalRows = currentTableData.length;
   const totalPages = Math.ceil(totalRows / pageSize) || 1;
   const paginatedData = currentTableData.slice(
     (currentPage - 1) * pageSize,
     currentPage * pageSize
   );
-  const activeColumns =
-    activeTab === 'cleaned' && cleanedStats ? cleanedStats.columns : originalStats.columns;
+
+  const filteredColumns = useMemo(() => {
+    const q = colFilterQuery.trim().toLowerCase();
+    if (!q) return workingActiveStats.columns;
+    return workingActiveStats.columns.filter((c) => c.toLowerCase().includes(q));
+  }, [workingActiveStats.columns, colFilterQuery]);
+
+  const totalColPages = Math.max(1, Math.ceil(filteredColumns.length / colPageSize));
+  const safeColPage = Math.min(colPage, totalColPages);
+  const visibleColumns = filteredColumns.slice(
+    (safeColPage - 1) * colPageSize,
+    safeColPage * colPageSize
+  );
+
+  const workingColumnsAll = (cleanedStats ?? originalStats).columns;
+  const pickerFilteredColumns = useMemo(() => {
+    const q = pickerSearchQuery.trim().toLowerCase();
+    return q
+      ? workingColumnsAll.filter((c) => c.toLowerCase().includes(q))
+      : workingColumnsAll;
+  }, [workingColumnsAll, pickerSearchQuery]);
 
   return (
     <div data-tour="data-cleaner-panel" className="space-y-6 max-w-7xl mx-auto">
@@ -450,8 +735,8 @@ export const DataCleanerPage: React.FC = () => {
             AI Data Cleaner & Statistical Profiler
           </h2>
           <p className="text-xs text-zinc-400 mt-1">
-            Upload CSV or XLSX files, review statistical profiles, describe cleaning steps in plain
-            English, and export verified results without altering original data.
+            Upload CSV or XLSX files, inspect exact cell-level audit trails, clean with plain English,
+            and export verified results without mutating original data.
           </p>
         </div>
 
@@ -480,6 +765,35 @@ export const DataCleanerPage: React.FC = () => {
           </button>
         </div>
       </div>
+
+      <AgentModeBar
+        mode={executionMode}
+        onModeChange={(nextMode) => {
+          setExecutionMode(nextMode);
+          setAiUnavailableError(null);
+          setErrorMessage(null);
+        }}
+        agentRole="lightweight"
+        disabled={isPlanning}
+        accentColor="emerald"
+      />
+
+      {aiUnavailableError && (
+        <AiUnavailableBanner
+          errorInfo={aiUnavailableError}
+          isBusy={isPlanning}
+          onRetryLive={() => {
+            void executeCleaningWithMode('live');
+          }}
+          onSwitchToDemoAndRun={() => {
+            setExecutionMode('demo');
+            setAiUnavailableError(null);
+            setErrorMessage(null);
+            void executeCleaningWithMode('demo');
+          }}
+          onDismiss={() => setAiUnavailableError(null)}
+        />
+      )}
 
       {statusMessage && (
         <div
@@ -604,8 +918,10 @@ export const DataCleanerPage: React.FC = () => {
             <Sparkles size={14} className="text-emerald-400" />
             <span>Describe Cleaning Instructions in Plain English</span>
           </label>
-          <span className="text-[11px] font-mono text-zinc-400">
-            Columns: {originalStats.columns.join(', ')}
+          <span className="text-[11px] font-mono text-zinc-400 truncate max-w-xl">
+            Columns ({originalStats.columns.length}):{' '}
+            {originalStats.columns.slice(0, 12).join(', ')}
+            {originalStats.columns.length > 12 ? `, +${originalStats.columns.length - 12} more` : ''}
           </span>
         </div>
 
@@ -616,7 +932,7 @@ export const DataCleanerPage: React.FC = () => {
             value={instruction}
             onChange={(e) => setInstruction(e.target.value)}
             rows={2}
-            placeholder="e.g., Remove duplicate rows, trim leading and trailing whitespace, fill missing age with mean, standardize signup_date to YYYY-MM-DD, or remove invalid emails."
+            placeholder='e.g., "Replace all missing values with 0.", "Remove duplicate rows, trim whitespace, standardize gender values into Male and Female", or "Remove rows where salary < 20000"'
             className="flex-1 px-3.5 py-2.5 rounded-xl bg-[#09090b] border border-zinc-800 text-zinc-100 text-xs focus:outline-none focus:border-emerald-500 resize-y min-h-[56px]"
           />
 
@@ -635,7 +951,7 @@ export const DataCleanerPage: React.FC = () => {
               ) : (
                 <>
                   <Sparkles size={14} />
-                  <span>Run Cleaning</span>
+                  <span>{executionMode === 'demo' ? 'Run Cleaning (Demo)' : 'Run Cleaning'}</span>
                 </>
               )}
             </button>
@@ -653,46 +969,151 @@ export const DataCleanerPage: React.FC = () => {
           </div>
         </div>
 
-        {/* Clarification / Invalid Column Prompt (Shown without mutating dataset) */}
+        {/* Missing Token Option */}
+        <div className="flex flex-wrap items-center justify-between gap-2 pt-1 text-[11px] text-zinc-400">
+          <label className="inline-flex items-center gap-2 cursor-pointer select-none">
+            <input
+              type="checkbox"
+              checked={treatNATokensAsMissing}
+              onChange={(e) => setTreatNATokensAsMissing(e.target.checked)}
+              className="rounded border-zinc-700 bg-zinc-900 text-emerald-500 focus:ring-0"
+            />
+            <span>
+              Treat literal text tokens (<code className="text-zinc-300">"NA"</code>,{' '}
+              <code className="text-zinc-300">"N/A"</code>, <code className="text-zinc-300">"null"</code>) as missing values
+            </span>
+          </label>
+          <span className="text-zinc-500">
+            Default preserves literal text like "NA" unless explicitly selected or replaced
+          </span>
+        </div>
+
+        {/* Interactive Clarification / Invalid Column / Multi-Column Removal Confirmation Box */}
         {clarificationFeedback && (
           <div
             data-testid="cleaning-clarification-box"
             role="status"
-            className="p-4 rounded-xl bg-amber-950/25 border border-amber-500/30 text-amber-100 text-xs space-y-1.5"
+            className="p-4 rounded-xl bg-amber-950/25 border border-amber-500/30 text-amber-100 text-xs space-y-3"
           >
-            <div className="flex items-center gap-2 font-semibold text-amber-300">
-              <HelpCircle size={15} className="shrink-0" />
-              <span>
-                {clarificationFeedback.status === 'invalid_column'
-                  ? 'Column Not Found — No Data Modified'
-                  : 'Clarification Needed — No Data Modified'}
-              </span>
+            <div className="space-y-1">
+              <div className="flex items-center gap-2 font-semibold text-amber-300">
+                <HelpCircle size={15} className="shrink-0" />
+                <span>
+                  {clarificationFeedback.status === 'invalid_column'
+                    ? 'Column Not Found — No Data Modified'
+                    : clarificationFeedback.pendingColumnRemovalCount
+                    ? `Confirmation Required Before Removing ${clarificationFeedback.pendingColumnRemovalCount} Column(s)`
+                    : 'Clarification Needed — No Data Modified'}
+                </span>
+              </div>
+              <p className="text-zinc-300">{clarificationFeedback.explanation}</p>
+              <p className="text-amber-200 font-medium">
+                {clarificationFeedback.clarificationQuestion}
+              </p>
             </div>
-            <p className="text-zinc-300">{clarificationFeedback.explanation}</p>
-            <p className="text-amber-200 font-medium">
-              {clarificationFeedback.clarificationQuestion}
-            </p>
+
+            {clarificationFeedback.pendingColumnRemovalCount && (
+              <div
+                data-testid="column-removal-picker"
+                className="p-3 rounded-lg bg-[#09090b] border border-zinc-800 space-y-2.5"
+              >
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <span className="text-[11px] font-semibold text-zinc-200">
+                    Select columns to remove ({selectedRemovalCols.length} selected):
+                  </span>
+                  <input
+                    type="text"
+                    value={pickerSearchQuery}
+                    onChange={(e) => setPickerSearchQuery(e.target.value)}
+                    placeholder="Filter columns..."
+                    className="px-2.5 py-1 rounded bg-[#111116] border border-zinc-800 text-xs text-zinc-200 focus:outline-none focus:border-amber-500"
+                  />
+                </div>
+                <div className="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-6 gap-1.5 max-h-36 overflow-y-auto pr-1">
+                  {pickerFilteredColumns.slice(0, 120).map((col) => {
+                    const checked = selectedRemovalCols.includes(col);
+                    return (
+                      <label
+                        key={col}
+                        className={`px-2 py-1 rounded border text-[11px] font-mono flex items-center gap-1.5 cursor-pointer truncate ${
+                          checked
+                            ? 'bg-rose-950/40 border-rose-500/40 text-rose-200'
+                            : 'bg-[#111116] border-zinc-800 text-zinc-300 hover:border-zinc-700'
+                        }`}
+                      >
+                        <input
+                          type="checkbox"
+                          checked={checked}
+                          onChange={() =>
+                            setSelectedRemovalCols((prev) =>
+                              prev.includes(col) ? prev.filter((c) => c !== col) : [...prev, col]
+                            )
+                          }
+                          className="rounded border-zinc-700 bg-zinc-900"
+                        />
+                        <span className="truncate">{col}</span>
+                      </label>
+                    );
+                  })}
+                </div>
+                <div className="flex flex-wrap items-center justify-end gap-2 pt-1">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setClarificationFeedback(null);
+                      setSelectedRemovalCols([]);
+                    }}
+                    className="px-3 py-1.5 rounded-lg border border-zinc-800 text-zinc-300 hover:text-white text-xs cursor-pointer"
+                  >
+                    Cancel
+                  </button>
+                  <button
+                    type="button"
+                    data-testid="confirm-column-removal-btn"
+                    disabled={selectedRemovalCols.length === 0}
+                    onClick={handleConfirmPendingColumnRemoval}
+                    className="px-3.5 py-1.5 rounded-lg bg-rose-600 hover:bg-rose-500 text-white text-xs font-semibold flex items-center gap-1.5 disabled:opacity-40 cursor-pointer"
+                  >
+                    <Trash2 size={13} />
+                    <span>Confirm & Remove ({selectedRemovalCols.length})</span>
+                  </button>
+                </div>
+              </div>
+            )}
           </div>
         )}
 
-        {/* Operation Execution Summary */}
+        {/* Operation Execution Summary Banner */}
         {cleaningResult && (
           <div
             data-testid="cleaning-summary-box"
             className="p-3.5 rounded-xl bg-[#09090b] border border-emerald-500/25 space-y-2 text-xs"
           >
             <div className="flex flex-wrap items-center justify-between gap-2">
-              <span className="font-semibold text-emerald-400">
-                {planExplanation || 'Completed Requested Cleaning Operations'}
-              </span>
+              <div className="flex flex-wrap items-center gap-2">
+                <span className="font-semibold text-emerald-400">
+                  {planExplanation || 'Completed Requested Cleaning Operations'}
+                </span>
+                <span className="px-2 py-0.5 rounded bg-zinc-900 border border-zinc-800 text-[10px] font-mono text-zinc-300">
+                  {lastPlanMode === 'demo' ? 'Demo Mode · Local' : 'Live AI · Gemini'}
+                </span>
+              </div>
               <div className="flex flex-wrap items-center gap-3 text-[11px] font-mono text-zinc-300 tabular-nums">
+                <span>Cells modified: {cleaningResult.cellsModified}</span>
+                <span>·</span>
                 <span>Rows removed: {cleaningResult.rowsRemoved}</span>
                 <span>·</span>
-                <span>Duplicates removed: {cleaningResult.duplicatesRemoved}</span>
+                <span>Columns removed: {cleaningResult.columnsRemoved}</span>
                 <span>·</span>
-                <span>Missing handled: {cleaningResult.missingValuesHandled}</span>
-                <span>·</span>
-                <span>Cells updated: {cleaningResult.affectedCells}</span>
+                <span>Completed: {cleaningResult.operationsCompleted}</span>
+                {cleaningResult.operationsFailed > 0 && (
+                  <>
+                    <span>·</span>
+                    <span className="text-rose-400">
+                      Failed: {cleaningResult.operationsFailed}
+                    </span>
+                  </>
+                )}
               </div>
             </div>
 
@@ -715,11 +1136,249 @@ export const DataCleanerPage: React.FC = () => {
         )}
       </form>
 
-      {/* Full-Width Data Preview Table (Before vs. After) */}
+      {/* CLEANING ACTIVITY REPORT (Driven 100% by real CleaningResult state) */}
+      {cleaningResult && (
+        <section
+          data-testid="cleaning-activity-report"
+          aria-label="Cleaning Activity Report"
+          className="rounded-2xl bg-[#111116] border border-zinc-800/80 p-5 space-y-5"
+        >
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 border-b border-zinc-800/80 pb-3.5">
+            <div className="space-y-0.5">
+              <div className="flex items-center gap-2 text-xs font-mono uppercase tracking-widest text-emerald-400">
+                <ClipboardList size={15} />
+                <span>CLEANING ACTIVITY REPORT</span>
+              </div>
+              <p className="text-xs text-zinc-400">
+                Verified before/after counts, cell-level audit trail with original row numbers, and
+                downloadable execution logs.
+              </p>
+            </div>
+
+            <div className="flex flex-wrap items-center gap-2">
+              <button
+                type="button"
+                data-testid="download-report-csv"
+                onClick={handleDownloadAuditCsv}
+                className="px-3 py-1.5 rounded-lg border border-zinc-800 bg-[#09090b] hover:bg-zinc-900 text-xs text-zinc-200 flex items-center gap-1.5 transition-colors cursor-pointer"
+              >
+                <FileText size={13} className="text-emerald-400" />
+                <span>Report CSV</span>
+              </button>
+              <button
+                type="button"
+                data-testid="download-report-json"
+                onClick={handleDownloadAuditJson}
+                className="px-3 py-1.5 rounded-lg border border-zinc-800 bg-[#09090b] hover:bg-zinc-900 text-xs text-zinc-200 flex items-center gap-1.5 transition-colors cursor-pointer"
+              >
+                <Download size={13} className="text-violet-400" />
+                <span>Report JSON</span>
+              </button>
+            </div>
+          </div>
+
+          {/* 12 Execution Summary Metric Cards */}
+          <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-2.5">
+            {[
+              { label: 'Total Rows Before', val: cleaningResult.statsBefore.rowCount, tone: 'text-zinc-100' },
+              { label: 'Total Rows After', val: cleaningResult.statsAfter.rowCount, tone: 'text-emerald-400' },
+              { label: 'Columns Before', val: cleaningResult.statsBefore.columnCount, tone: 'text-zinc-100' },
+              { label: 'Columns After', val: cleaningResult.statsAfter.columnCount, tone: 'text-emerald-400' },
+              { label: 'Missing Before', val: cleaningResult.statsBefore.totalMissingValues, tone: 'text-rose-400' },
+              { label: 'Missing After', val: cleaningResult.statsAfter.totalMissingValues, tone: 'text-emerald-400' },
+              { label: 'Duplicates Removed', val: cleaningResult.duplicatesRemoved, tone: 'text-amber-300' },
+              { label: 'Cells Modified', val: cleaningResult.cellsModified, tone: 'text-emerald-300' },
+              { label: 'Rows Removed', val: cleaningResult.rowsRemoved, tone: 'text-rose-300' },
+              { label: 'Columns Removed', val: cleaningResult.columnsRemoved, tone: 'text-rose-300' },
+              { label: 'Ops Completed', val: cleaningResult.operationsCompleted, tone: 'text-emerald-400' },
+              {
+                label: 'Ops Failed',
+                val: cleaningResult.operationsFailed,
+                tone: cleaningResult.operationsFailed > 0 ? 'text-rose-400' : 'text-zinc-400',
+              },
+            ].map((card) => (
+              <div
+                key={card.label}
+                className="p-3 rounded-xl bg-[#09090b] border border-zinc-800/80"
+              >
+                <span className="text-[10px] font-mono uppercase tracking-wider text-zinc-500 block">
+                  {card.label}
+                </span>
+                <span className={`text-lg font-bold tabular-nums mt-0.5 block ${card.tone}`}>
+                  {card.val}
+                </span>
+              </div>
+            ))}
+          </div>
+
+          {/* Audit Filters */}
+          <div className="flex flex-wrap items-center gap-2.5 p-3 rounded-xl bg-[#09090b] border border-zinc-800/80 text-xs">
+            <div className="flex items-center gap-1.5 text-zinc-400 mr-1">
+              <Filter size={13} />
+              <span className="font-semibold">Audit Filters:</span>
+            </div>
+
+            <select
+              aria-label="Filter by operation"
+              value={auditOpFilter}
+              onChange={(e) => {
+                setAuditOpFilter(e.target.value);
+                setAuditPage(1);
+              }}
+              className="px-2.5 py-1 rounded-lg bg-[#111116] border border-zinc-800 text-zinc-200 text-xs"
+            >
+              <option value="ALL">All Operations</option>
+              {availableAuditOperations.map((opLabel) => (
+                <option key={opLabel} value={opLabel}>
+                  {opLabel}
+                </option>
+              ))}
+            </select>
+
+            <select
+              aria-label="Filter by status"
+              value={auditStatusFilter}
+              onChange={(e) => {
+                setAuditStatusFilter(e.target.value as any);
+                setAuditPage(1);
+              }}
+              className="px-2.5 py-1 rounded-lg bg-[#111116] border border-zinc-800 text-zinc-200 text-xs"
+            >
+              <option value="ALL">All Statuses</option>
+              <option value="changed">Changed (Green)</option>
+              <option value="removed">Removed (Red)</option>
+              <option value="attention">Needs Attention (Amber)</option>
+              <option value="unchanged">Unchanged (Grey)</option>
+            </select>
+
+            <input
+              type="text"
+              aria-label="Filter audit by column"
+              value={auditColFilter}
+              onChange={(e) => {
+                setAuditColFilter(e.target.value);
+                setAuditPage(1);
+              }}
+              placeholder="Column name..."
+              className="px-2.5 py-1 rounded-lg bg-[#111116] border border-zinc-800 text-zinc-200 text-xs w-36"
+            />
+
+            <input
+              type="text"
+              aria-label="Filter audit by original row number"
+              value={auditRowFilter}
+              onChange={(e) => {
+                setAuditRowFilter(e.target.value);
+                setAuditPage(1);
+              }}
+              placeholder="Orig Row #..."
+              className="px-2.5 py-1 rounded-lg bg-[#111116] border border-zinc-800 text-zinc-200 text-xs w-28"
+            />
+
+            <span className="ml-auto text-[11px] font-mono text-zinc-500 tabular-nums">
+              {filteredAuditLog.length} event{filteredAuditLog.length === 1 ? '' : 's'}
+              {cleaningResult.auditLogTruncated
+                ? ` (showing first ${cleaningResult.auditLog.length} of ${cleaningResult.totalAuditEvents})`
+                : ''}
+            </span>
+          </div>
+
+          {/* Audit Table */}
+          <div className="rounded-xl border border-zinc-800/80 overflow-x-auto bg-[#09090b]">
+            <table className="w-full text-left text-xs border-collapse">
+              <thead>
+                <tr className="border-b border-zinc-800 bg-[#0d0d12] text-zinc-400 font-mono text-[10px] uppercase">
+                  <th className="px-3 py-2">Orig Row</th>
+                  <th className="px-3 py-2">Column</th>
+                  <th className="px-3 py-2">Previous Value</th>
+                  <th className="px-3 py-2">New Value</th>
+                  <th className="px-3 py-2">Operation</th>
+                  <th className="px-3 py-2">Reason</th>
+                  <th className="px-3 py-2">Status</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-zinc-800/60 font-mono text-[11px]">
+                {paginatedAuditLog.length === 0 ? (
+                  <tr>
+                    <td colSpan={7} className="px-4 py-6 text-center text-zinc-500 font-sans text-xs">
+                      No audit events match the selected filters.
+                    </td>
+                  </tr>
+                ) : (
+                  paginatedAuditLog.map((entry) => {
+                    const statusBadgeClass =
+                      entry.status === 'changed'
+                        ? 'bg-emerald-950/60 text-emerald-300 border-emerald-500/30'
+                        : entry.status === 'removed'
+                        ? 'bg-rose-950/60 text-rose-300 border-rose-500/30'
+                        : entry.status === 'attention'
+                        ? 'bg-amber-950/60 text-amber-300 border-amber-500/30'
+                        : 'bg-zinc-900 text-zinc-400 border-zinc-700';
+
+                    return (
+                      <tr key={entry.id} className="hover:bg-zinc-900/40">
+                        <td className="px-3 py-2 text-zinc-400 tabular-nums">
+                          {entry.originalRow !== null ? `#${entry.originalRow}` : 'Schema'}
+                        </td>
+                        <td className="px-3 py-2 text-zinc-200 font-semibold">{entry.column}</td>
+                        <td className="px-3 py-2 text-zinc-400 max-w-[180px] truncate">
+                          {entry.previousValue}
+                        </td>
+                        <td className="px-3 py-2 text-zinc-100 max-w-[180px] truncate">
+                          {entry.newValue}
+                        </td>
+                        <td className="px-3 py-2 text-zinc-300 whitespace-nowrap">
+                          {entry.operationLabel}
+                        </td>
+                        <td className="px-3 py-2 text-zinc-400 font-sans text-xs">{entry.reason}</td>
+                        <td className="px-3 py-2 whitespace-nowrap">
+                          <span
+                            className={`px-2 py-0.5 rounded border text-[10px] uppercase ${statusBadgeClass}`}
+                          >
+                            {entry.status}
+                          </span>
+                        </td>
+                      </tr>
+                    );
+                  })
+                )}
+              </tbody>
+            </table>
+          </div>
+
+          {totalAuditPages > 1 && (
+            <div className="flex items-center justify-between text-xs text-zinc-400 tabular-nums">
+              <span>
+                Audit Page {auditPage} of {totalAuditPages}
+              </span>
+              <div className="flex items-center gap-1.5">
+                <button
+                  type="button"
+                  onClick={() => setAuditPage((p) => Math.max(1, p - 1))}
+                  disabled={auditPage <= 1}
+                  className="px-2.5 py-1 rounded bg-zinc-900 border border-zinc-800 disabled:opacity-40 cursor-pointer"
+                >
+                  Prev
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setAuditPage((p) => Math.min(totalAuditPages, p + 1))}
+                  disabled={auditPage >= totalAuditPages}
+                  className="px-2.5 py-1 rounded bg-zinc-900 border border-zinc-800 disabled:opacity-40 cursor-pointer"
+                >
+                  Next
+                </button>
+              </div>
+            </div>
+          )}
+        </section>
+      )}
+
+      {/* Full-Width Data Preview Table (Original / Cleaned / Before vs After Comparison) */}
       <div className="flex flex-col rounded-2xl bg-[#111116] border border-zinc-800/80 overflow-hidden min-h-[480px]">
         {/* Table Header Bar */}
         <div className="px-4 py-2.5 border-b border-zinc-800/80 bg-[#0d0d12] flex flex-wrap items-center justify-between gap-3">
-          <div className="flex items-center gap-1 p-1 bg-[#09090b] border border-zinc-800 rounded-lg">
+          <div className="flex flex-wrap items-center gap-1 p-1 bg-[#09090b] border border-zinc-800 rounded-lg">
             <button
               type="button"
               onClick={() => {
@@ -751,10 +1410,67 @@ export const DataCleanerPage: React.FC = () => {
             >
               Cleaned Output {cleanedData ? `(${cleanedData.length} rows)` : '(Run to view)'}
             </button>
+            <button
+              type="button"
+              onClick={() => {
+                if (cleanedData) {
+                  setActiveTab('compare');
+                  setCurrentPage(1);
+                }
+              }}
+              disabled={!cleanedData}
+              className={`px-3 py-1 rounded-md text-xs font-medium transition-colors disabled:opacity-40 cursor-pointer ${
+                activeTab === 'compare'
+                  ? 'bg-amber-600 text-white shadow-sm'
+                  : 'text-zinc-400 hover:text-white'
+              }`}
+            >
+              Before vs After
+            </button>
           </div>
 
-          {/* Export buttons */}
-          <div className="flex items-center gap-2">
+          {/* Column Window Controls (prevents DOM freeze on 1,005+ columns) */}
+          <div className="flex flex-wrap items-center gap-2 text-xs">
+            <div className="flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-[#09090b] border border-zinc-800">
+              <Columns size={13} className="text-zinc-400" />
+              <input
+                type="text"
+                value={colFilterQuery}
+                onChange={(e) => {
+                  setColFilterQuery(e.target.value);
+                  setColPage(1);
+                }}
+                placeholder="Jump/filter col..."
+                className="bg-transparent text-xs text-zinc-200 focus:outline-none w-28"
+              />
+            </div>
+            {filteredColumns.length > colPageSize && (
+              <div className="flex items-center gap-1 text-[11px] font-mono text-zinc-400">
+                <button
+                  type="button"
+                  onClick={() => setColPage((p) => Math.max(1, p - 1))}
+                  disabled={safeColPage <= 1}
+                  className="px-2 py-1 rounded bg-zinc-900 border border-zinc-800 disabled:opacity-40 cursor-pointer"
+                >
+                  Cols -
+                </button>
+                <span>
+                  Cols {(safeColPage - 1) * colPageSize + 1}–
+                  {Math.min(safeColPage * colPageSize, filteredColumns.length)} /{' '}
+                  {filteredColumns.length}
+                </span>
+                <button
+                  type="button"
+                  onClick={() => setColPage((p) => Math.min(totalColPages, p + 1))}
+                  disabled={safeColPage >= totalColPages}
+                  className="px-2 py-1 rounded bg-zinc-900 border border-zinc-800 disabled:opacity-40 cursor-pointer"
+                >
+                  Cols +
+                </button>
+              </div>
+            )}
+
+            {/* Export buttons */}
             <button
               type="button"
               onClick={() => exportToCsv(currentTableData, filename)}
@@ -776,23 +1492,39 @@ export const DataCleanerPage: React.FC = () => {
           </div>
         </div>
 
+        {/* Visual Color Legend */}
+        {cleaningResult && activeTab !== 'original' && (
+          <div className="px-4 py-1.5 border-b border-zinc-800/60 bg-[#0b0b0f] flex flex-wrap items-center gap-4 text-[11px] text-zinc-400">
+            <span className="inline-flex items-center gap-1.5">
+              <span className="w-2.5 h-2.5 rounded-sm bg-emerald-500/70 inline-block" />
+              <span>Changed Value</span>
+            </span>
+            <span className="inline-flex items-center gap-1.5">
+              <span className="w-2.5 h-2.5 rounded-sm bg-rose-500/70 inline-block" />
+              <span>Missing / Removed</span>
+            </span>
+            <span className="inline-flex items-center gap-1.5">
+              <span className="w-2.5 h-2.5 rounded-sm bg-amber-500/70 inline-block" />
+              <span>Needs Attention</span>
+            </span>
+            <span className="inline-flex items-center gap-1.5">
+              <span className="w-2.5 h-2.5 rounded-sm bg-zinc-700 inline-block" />
+              <span>Unchanged</span>
+            </span>
+          </div>
+        )}
+
         {/* Tabular Data View */}
         <div className="flex-1 overflow-x-auto bg-[#09090b]">
           <table className="w-full text-left text-xs border-collapse">
             <thead>
               <tr className="border-b border-zinc-800/80 bg-[#0d0d12]">
-                <th className="px-3 py-2.5 text-zinc-500 font-mono text-[10px] w-12 text-center">
-                  #
+                <th className="px-3 py-2.5 text-zinc-500 font-mono text-[10px] w-16 text-center">
+                  {activeTab !== 'original' && cleaningResult ? 'Orig #' : '#'}
                 </th>
-                {activeColumns.map((col) => {
-                  const colType =
-                    activeTab === 'cleaned' && cleanedStats
-                      ? cleanedStats.columnTypes[col]
-                      : originalStats.columnTypes[col];
-                  const missingInCol =
-                    activeTab === 'cleaned' && cleanedStats
-                      ? cleanedStats.missingCounts[col] || 0
-                      : originalStats.missingCounts[col] || 0;
+                {visibleColumns.map((col) => {
+                  const colType = workingActiveStats.columnTypes[col];
+                  const missingInCol = workingActiveStats.missingCounts[col] || 0;
 
                   return (
                     <th key={col} className="px-3 py-2.5 text-zinc-200 font-semibold whitespace-nowrap">
@@ -814,28 +1546,70 @@ export const DataCleanerPage: React.FC = () => {
             </thead>
             <tbody className="divide-y divide-zinc-800/60 font-mono">
               {paginatedData.map((row, rowIdx) => {
-                const globalIdx = (currentPage - 1) * pageSize + rowIdx + 1;
+                const activeRowIdx = (currentPage - 1) * pageSize + rowIdx;
+                const origRowNum =
+                  activeTab !== 'original' && cleaningResult?.originalRowNumbers
+                    ? cleaningResult.originalRowNumbers[activeRowIdx] ?? activeRowIdx + 1
+                    : activeRowIdx + 1;
+                const origRowObj =
+                  activeTab === 'compare' && origRowNum > 0
+                    ? originalData[origRowNum - 1]
+                    : null;
+
                 return (
-                  <tr key={globalIdx} className="hover:bg-zinc-900/50 transition-colors">
-                    <td className="px-3 py-2 text-zinc-600 text-center text-[10px] tabular-nums">
-                      {globalIdx}
+                  <tr key={`${activeRowIdx}_${origRowNum}`} className="hover:bg-zinc-900/50 transition-colors">
+                    <td className="px-3 py-2 text-zinc-500 text-center text-[10px] tabular-nums">
+                      #{origRowNum}
                     </td>
-                    {activeColumns.map((col) => {
+                    {visibleColumns.map((col) => {
                       const val = row[col];
-                      const isMissing =
-                        val === undefined ||
-                        val === null ||
-                        val === '' ||
-                        (typeof val === 'number' && Number.isNaN(val));
+                      const missing = isMissingValue(val, missingConfig);
+                      const cellAudit =
+                        activeTab !== 'original'
+                          ? cleaningResult?.cellAuditByRowCol[`${activeRowIdx}:${col}`]
+                          : undefined;
+
+                      let cellClass = 'text-zinc-300';
+                      if (cellAudit?.status === 'changed') {
+                        cellClass = 'bg-emerald-950/35 text-emerald-200 border-l-2 border-emerald-500/70';
+                      } else if (cellAudit?.status === 'attention') {
+                        cellClass = 'bg-amber-950/35 text-amber-200 border-l-2 border-amber-500/70';
+                      } else if (missing) {
+                        cellClass = 'text-rose-400/80 italic bg-rose-950/15';
+                      }
+
+                      const origVal = origRowObj ? origRowObj[col] : undefined;
+                      const showCompare =
+                        activeTab === 'compare' &&
+                        origRowObj &&
+                        String(origVal ?? '') !== String(val ?? '');
 
                       return (
                         <td
                           key={col}
-                          className={`px-3 py-2 whitespace-nowrap text-xs ${
-                            isMissing ? 'text-rose-400/80 italic bg-rose-950/15' : 'text-zinc-300'
-                          }`}
+                          title={
+                            cellAudit
+                              ? `${cellAudit.operation}: ${cellAudit.previousValue} -> ${cellAudit.newValue}`
+                              : undefined
+                          }
+                          className={`px-3 py-2 whitespace-nowrap text-xs ${cellClass}`}
                         >
-                          {isMissing ? '<empty>' : String(val)}
+                          {showCompare ? (
+                            <span className="inline-flex items-center gap-1.5">
+                              <span className="line-through text-zinc-500 text-[10px]">
+                                {isMissingValue(origVal, missingConfig)
+                                  ? '<empty>'
+                                  : String(origVal)}
+                              </span>
+                              <span className="text-emerald-300 font-semibold">
+                                {missing ? '<empty>' : String(val)}
+                              </span>
+                            </span>
+                          ) : missing ? (
+                            '<empty>'
+                          ) : (
+                            String(val)
+                          )}
                         </td>
                       );
                     })}

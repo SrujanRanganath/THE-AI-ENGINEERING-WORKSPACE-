@@ -1,0 +1,66 @@
+{
+  "checkedAtMs": 1795005000000,
+  "checkedAtIso": "2026-11-18T04:30:00.000Z",
+  "results": [
+    {
+      "modelId": "gemini-3.1-flash-lite",
+      "accessStatus": "verified",
+      "status": 200
+    },
+    {
+      "modelId": "gemini-3.5-flash-lite",
+      "accessStatus": "verified",
+      "status": 200
+    },
+    {
+      "modelId": "gemini-flash-lite-latest",
+      "accessStatus": "verified",
+      "status": 200
+    },
+    {
+      "modelId": "gemini-3-flash-preview",
+      "accessStatus": "verified",
+      "status": 200
+    },
+    {
+      "modelId": "gemini-4-hydrogen",
+      "accessStatus": "unavailable",
+      "status": 503,
+      "errorReason": "HTTP 503: This model is currently experiencing high demand. Spikes in demand are usually temporary.",
+      "cooldownSeconds": 30
+    },
+    {
+      "modelId": "gemini-3.8-flash",
+      "accessStatus": "unavailable",
+      "status": 503,
+      "errorReason": "HTTP 503: This model is currently experiencing high demand. Spikes in demand are usually temporary.",
+      "cooldownSeconds": 30
+    },
+    {
+      "modelId": "gemini-flash-latest",
+      "accessStatus": "unavailable",
+      "status": 503,
+      "errorReason": "HTTP 503: This model is currently experiencing high demand. Spikes in demand are usually temporary.",
+      "cooldownSeconds": 30
+    },
+    {
+      "modelId": "gemini-4-argon",
+      "accessStatus": "quota_exhausted",
+      "status": 429,
+      "errorReason": "HTTP 429: You exceeded your current quota, please check your plan and billing details.",
+      "cooldownSeconds": 60
+    },
+    {
+      "modelId": "gemini-2.5-flash",
+      "accessStatus": "unsupported",
+      "status": 404,
+      "errorReason": "HTTP 404: models/gemini-2.5-flash is no longer available to new users. Please update your code to use models/gemini-3.8-flash"
+    },
+    {
+      "modelId": "gemini-2.5-flash-lite",
+      "accessStatus": "unsupported",
+      "status": 404,
+      "errorReason": "HTTP 404: models/gemini-2.5-flash-lite is no longer available to new users. Please update your code to use models/gemini-3.5-flash-lite"
+    }
+  ]
+}

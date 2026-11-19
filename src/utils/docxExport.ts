@@ -1,6 +1,32 @@
+export interface FirestoreDocumentTableRow {
+  cells: string[];
+}
+
+export type DocumentTableRowInput = string[] | FirestoreDocumentTableRow;
+
 export interface DocumentTable {
   headers: string[];
-  rows: string[][];
+  rows: DocumentTableRowInput[];
+}
+
+/**
+ * Normalizes table rows whether stored as in-memory `string[][]` or
+ * Firestore-compatible `Array<{ cells: string[] }>` back into `string[][]`.
+ */
+export function normalizeTableRowsTo2D(rows: unknown): string[][] {
+  if (!Array.isArray(rows)) return [];
+  return rows.map((row) => {
+    if (Array.isArray(row)) {
+      return row.map((cell) => String(cell ?? ''));
+    }
+    if (row && typeof row === 'object' && Array.isArray((row as FirestoreDocumentTableRow).cells)) {
+      return (row as FirestoreDocumentTableRow).cells.map((cell) => String(cell ?? ''));
+    }
+    if (row && typeof row === 'object' && Array.isArray((row as any).items)) {
+      return (row as any).items.map((cell: unknown) => String(cell ?? ''));
+    }
+    return [String(row ?? '')];
+  });
 }
 
 export type DocumentContentBlock =
@@ -307,12 +333,16 @@ export async function generateDocxBuffer(docData: StructuredDocumentData): Promi
       : docData.sections;
 
   const renderTable = (tableData: DocumentTable) => {
-    const colCount = Math.max(1, tableData.headers.length);
+    const safeHeaders = Array.isArray(tableData?.headers)
+      ? tableData.headers.map((h) => String(h ?? ''))
+      : [];
+    const normalizedRows = normalizeTableRowsTo2D(tableData?.rows);
+    const colCount = Math.max(1, safeHeaders.length);
     const colWidthPct = Math.floor(100 / colCount);
 
     const headerRow = new TableRow({
       tableHeader: true,
-      children: tableData.headers.map(
+      children: safeHeaders.map(
         (h) =>
           new TableCell({
             width: { size: colWidthPct, type: WidthType.PERCENTAGE },
@@ -332,10 +362,10 @@ export async function generateDocxBuffer(docData: StructuredDocumentData): Promi
       ),
     });
 
-    const dataRows = tableData.rows.map(
+    const dataRows = normalizedRows.map(
       (r) =>
         new TableRow({
-          children: tableData.headers.map(
+          children: safeHeaders.map(
             (_h, idx) =>
               new TableCell({
                 width: { size: colWidthPct, type: WidthType.PERCENTAGE },
@@ -358,6 +388,93 @@ export async function generateDocxBuffer(docData: StructuredDocumentData): Promi
       width: { size: 100, type: WidthType.PERCENTAGE },
       rows: [headerRow, ...dataRows],
     });
+  };
+
+  const renderSectionBlocks = (sec: any) => {
+    if (Array.isArray(sec.paragraphs)) {
+      sec.paragraphs.forEach((p: string) => {
+        if (!String(p || '').trim()) return;
+        children.push(
+          new Paragraph({
+            spacing: { after: 160, line: 300 },
+            children: buildInlineTextRuns(TextRun, String(p), {
+              size: 22,
+              color: '334155',
+              font: 'Calibri',
+            }),
+          })
+        );
+      });
+    }
+
+    if (Array.isArray(sec.bullets) && sec.bullets.length > 0) {
+      sec.bullets.forEach((b: string) => {
+        if (!String(b || '').trim()) return;
+        children.push(
+          new Paragraph({
+            bullet: { level: 0 },
+            spacing: { after: 100 },
+            children: buildInlineTextRuns(TextRun, String(b), {
+              size: 22,
+              color: '334155',
+              font: 'Calibri',
+            }),
+          })
+        );
+      });
+    }
+
+    if (Array.isArray(sec.numberedItems) && sec.numberedItems.length > 0) {
+      sec.numberedItems.forEach((item: string) => {
+        if (!String(item || '').trim()) return;
+        children.push(
+          new Paragraph({
+            numbering: { reference: 'default-numbered-list', level: 0 },
+            spacing: { after: 100 },
+            children: buildInlineTextRuns(TextRun, String(item), {
+              size: 22,
+              color: '334155',
+              font: 'Calibri',
+            }),
+          })
+        );
+      });
+    }
+
+    if (Array.isArray(sec.tables) && sec.tables.length > 0) {
+      sec.tables.forEach((t: DocumentTable) => {
+        if (t && Array.isArray(t.headers) && t.headers.length > 0) {
+          children.push(renderTable(t));
+          children.push(new Paragraph({ spacing: { after: 120 }, children: [] }));
+        }
+      });
+    } else if (sec.table && Array.isArray(sec.table.headers) && sec.table.headers.length > 0) {
+      children.push(renderTable(sec.table));
+      children.push(new Paragraph({ spacing: { after: 120 }, children: [] }));
+    }
+
+    if (Array.isArray(sec.subsections) && sec.subsections.length > 0) {
+      sec.subsections.forEach((sub: any) => {
+        if (sub?.subheading && String(sub.subheading).trim()) {
+          children.push(
+            new Paragraph({
+              heading: HeadingLevel.HEADING_3,
+              spacing: { before: 220, after: 100 },
+              children: [
+                new TextRun({
+                  text: String(sub.subheading).trim(),
+                  bold: true,
+                  size: 24,
+                  color: '0F172A',
+                  font: 'Calibri',
+                }),
+              ],
+            })
+          );
+        }
+        renderSectionBlocks(sub);
+      });
+    }
   };
 
   // Render Each Section
@@ -434,60 +551,7 @@ export async function generateDocxBuffer(docData: StructuredDocumentData): Promi
     }
 
     // Legacy fallback if caller passed DocumentSection without blocks
-    sec.paragraphs.forEach((p) => {
-      if (!p.trim()) return;
-      children.push(
-        new Paragraph({
-          spacing: { after: 160, line: 300 },
-          children: buildInlineTextRuns(TextRun, p, {
-            size: 22,
-            color: '334155',
-            font: 'Calibri',
-          }),
-        })
-      );
-    });
-
-    if (sec.bullets && sec.bullets.length > 0) {
-      sec.bullets.forEach((b) => {
-        if (!b.trim()) return;
-        children.push(
-          new Paragraph({
-            bullet: { level: 0 },
-            spacing: { after: 100 },
-            children: buildInlineTextRuns(TextRun, b, {
-              size: 22,
-              color: '334155',
-              font: 'Calibri',
-            }),
-          })
-        );
-      });
-    }
-
-    if (sec.numberedItems && sec.numberedItems.length > 0) {
-      sec.numberedItems.forEach((item) => {
-        if (!item.trim()) return;
-        children.push(
-          new Paragraph({
-            numbering: { reference: 'default-numbered-list', level: 0 },
-            spacing: { after: 100 },
-            children: buildInlineTextRuns(TextRun, item, {
-              size: 22,
-              color: '334155',
-              font: 'Calibri',
-            }),
-          })
-        );
-      });
-    }
-
-    if (sec.tables && sec.tables.length > 0) {
-      sec.tables.forEach((t) => {
-        children.push(renderTable(t));
-        children.push(new Paragraph({ spacing: { after: 120 }, children: [] }));
-      });
-    }
+    renderSectionBlocks(sec);
   });
 
   const doc = new Document({

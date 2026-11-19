@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { useSearchParams } from 'react-router-dom';
 import { useAuth } from '../../lib/authContext';
 import {
@@ -7,10 +7,17 @@ import {
   updateDocument,
   deleteDocument,
   logActivity,
+  toSafeUserFirestoreErrorMessage,
   DocumentRecord,
 } from '../../lib/firestoreService';
-import { downloadDocx } from '../../utils/docxExport';
+import { downloadDocx, parseMarkdownIntoSections } from '../../utils/docxExport';
 import { ModalDialog, ConfirmModal } from '../../components/common/ModalPrimitives';
+import {
+  AgentExecutionMode,
+  generateDemoDocumentData,
+} from '../../utils/demoModeEngine';
+import { getAiRequestHeaders, parseAiFailure, ParsedAiErrorInfo } from '../../lib/aiClient';
+import { AgentModeBar, AiUnavailableBanner } from '../../components/common/AgentModeControls';
 import {
   FileText,
   Download,
@@ -119,12 +126,43 @@ All AI provider interactions execute through server-side Express proxy routes wh
 }
 
 /**
- * Lightweight safe Markdown renderer for document preview (headings, bullets, numbered lists, tables).
+ * Render inline **bold** and `code` tokens as safe React nodes without dangerouslySetInnerHTML.
  */
-const MarkdownDocumentPreview: React.FC<{ content: string }> = ({ content }) => {
+function renderInlineMarkdown(text: string): React.ReactNode {
+  const parts = text.split(/(\*\*[^*]+\*\*|`[^`]+`)/g);
+  return parts.map((part, idx) => {
+    if (part.startsWith('**') && part.endsWith('**') && part.length > 4) {
+      return (
+        <strong key={idx} className="font-semibold text-zinc-100">
+          {part.slice(2, -2)}
+        </strong>
+      );
+    }
+    if (part.startsWith('`') && part.endsWith('`') && part.length > 2) {
+      return (
+        <code
+          key={idx}
+          className="px-1.5 py-0.5 rounded bg-zinc-900 border border-zinc-800 font-mono text-[11px] text-violet-300"
+        >
+          {part.slice(1, -1)}
+        </code>
+      );
+    }
+    return <React.Fragment key={idx}>{part}</React.Fragment>;
+  });
+}
+
+/**
+ * Lightweight safe Markdown renderer for document preview (headings, blockquotes, bullets, numbered lists, tables).
+ */
+const MarkdownDocumentPreview: React.FC<{ content: string; documentTitle?: string }> = ({
+  content,
+  documentTitle,
+}) => {
   const lines = (content || '').split(/\r?\n/);
   const nodes: React.ReactNode[] = [];
   let i = 0;
+  let skippedLeadingTitle = false;
 
   const isTableRow = (line: string) =>
     line.trim().startsWith('|') && line.trim().endsWith('|') && line.trim().length >= 3;
@@ -154,7 +192,7 @@ const MarkdownDocumentPreview: React.FC<{ content: string }> = ({ content }) => 
     if (trimmed.startsWith('### ')) {
       nodes.push(
         <h3 key={`h3-${i}`} className="text-sm font-semibold text-zinc-100 pt-3">
-          {trimmed.slice(4)}
+          {renderInlineMarkdown(trimmed.slice(4))}
         </h3>
       );
       i++;
@@ -167,7 +205,7 @@ const MarkdownDocumentPreview: React.FC<{ content: string }> = ({ content }) => 
           key={`h2-${i}`}
           className="text-base font-bold text-white pt-4 pb-1 border-b border-zinc-800/80"
         >
-          {trimmed.slice(3)}
+          {renderInlineMarkdown(trimmed.slice(3))}
         </h2>
       );
       i++;
@@ -175,12 +213,41 @@ const MarkdownDocumentPreview: React.FC<{ content: string }> = ({ content }) => 
     }
 
     if (trimmed.startsWith('# ')) {
+      const headingText = trimmed.slice(2).trim();
+      if (
+        !skippedLeadingTitle &&
+        documentTitle &&
+        headingText.toLowerCase() === documentTitle.trim().toLowerCase()
+      ) {
+        skippedLeadingTitle = true;
+        i++;
+        continue;
+      }
       nodes.push(
         <h1 key={`h1-${i}`} className="text-lg font-bold text-white pt-2">
-          {trimmed.slice(2)}
+          {renderInlineMarkdown(headingText)}
         </h1>
       );
       i++;
+      continue;
+    }
+
+    if (trimmed.startsWith('> ')) {
+      const quoteLines: string[] = [];
+      while (i < lines.length && lines[i].trim().startsWith('> ')) {
+        quoteLines.push(lines[i].trim().slice(2).trim());
+        i++;
+      }
+      nodes.push(
+        <blockquote
+          key={`bq-${i}`}
+          className="border-l-2 border-amber-500/70 bg-amber-500/5 px-3.5 py-2.5 rounded-r-lg text-xs text-zinc-300 leading-relaxed space-y-1"
+        >
+          {quoteLines.map((qLine, qIdx) => (
+            <p key={qIdx}>{renderInlineMarkdown(qLine)}</p>
+          ))}
+        </blockquote>
+      );
       continue;
     }
 
@@ -201,7 +268,7 @@ const MarkdownDocumentPreview: React.FC<{ content: string }> = ({ content }) => 
               <tr>
                 {headers.map((h, idx) => (
                   <th key={idx} className="px-3 py-2 font-semibold text-zinc-200">
-                    {h}
+                    {renderInlineMarkdown(h)}
                   </th>
                 ))}
               </tr>
@@ -211,7 +278,7 @@ const MarkdownDocumentPreview: React.FC<{ content: string }> = ({ content }) => 
                 <tr key={rIdx} className="hover:bg-zinc-900/40">
                   {headers.map((_, cIdx) => (
                     <td key={cIdx} className="px-3 py-2 text-zinc-300">
-                      {row[cIdx] || ''}
+                      {renderInlineMarkdown(row[cIdx] || '')}
                     </td>
                   ))}
                 </tr>
@@ -232,7 +299,7 @@ const MarkdownDocumentPreview: React.FC<{ content: string }> = ({ content }) => 
       nodes.push(
         <ul key={`ul-${i}`} className="list-disc pl-5 space-y-1 text-xs text-zinc-300">
           {items.map((item, idx) => (
-            <li key={idx}>{item}</li>
+            <li key={idx}>{renderInlineMarkdown(item)}</li>
           ))}
         </ul>
       );
@@ -248,7 +315,7 @@ const MarkdownDocumentPreview: React.FC<{ content: string }> = ({ content }) => 
       nodes.push(
         <ol key={`ol-${i}`} className="list-decimal pl-5 space-y-1 text-xs text-zinc-300">
           {items.map((item, idx) => (
-            <li key={idx}>{item}</li>
+            <li key={idx}>{renderInlineMarkdown(item)}</li>
           ))}
         </ol>
       );
@@ -257,7 +324,7 @@ const MarkdownDocumentPreview: React.FC<{ content: string }> = ({ content }) => 
 
     nodes.push(
       <p key={`p-${i}`} className="text-xs text-zinc-300 leading-relaxed">
-        {trimmed}
+        {renderInlineMarkdown(trimmed)}
       </p>
     );
     i++;
@@ -279,8 +346,11 @@ export const DocumentGeneratorPage: React.FC = () => {
   const [prompt, setPrompt] = useState('');
 
   // Generation & Status
+  const [executionMode, setExecutionMode] = useState<AgentExecutionMode>('live');
   const [isGenerating, setIsGenerating] = useState(false);
+  const generatingRef = useRef(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  const [aiUnavailableError, setAiUnavailableError] = useState<ParsedAiErrorInfo | null>(null);
   const [statusBanner, setStatusBanner] = useState<string | null>(null);
 
   // Active Document
@@ -288,6 +358,7 @@ export const DocumentGeneratorPage: React.FC = () => {
   const [isEditing, setIsEditing] = useState(false);
   const [editedContent, setEditedContent] = useState('');
   const [isSaving, setIsSaving] = useState(false);
+  const [hasPendingCloudSave, setHasPendingCloudSave] = useState(false);
   const [copied, setCopied] = useState(false);
   const [isExportingDocx, setIsExportingDocx] = useState(false);
 
@@ -312,6 +383,7 @@ export const DocumentGeneratorPage: React.FC = () => {
         const match = list.find((d) => d.id === docIdParam);
         if (match) {
           setCurrentDoc(match);
+          setHasPendingCloudSave(false);
           setTitle(match.title);
           if (DOCUMENT_TYPES.includes(match.category)) {
             setDocumentType(match.category);
@@ -336,10 +408,103 @@ export const DocumentGeneratorPage: React.FC = () => {
     setCurrentDoc(null);
     setEditedContent('');
     setIsEditing(false);
+    setHasPendingCloudSave(false);
     setTitle('');
     setPrompt('');
     setErrorMessage(null);
     setStatusBanner(null);
+  };
+
+  const persistGeneratedDocument = async (
+    generated: {
+      title?: string;
+      subtitle?: string;
+      category?: string;
+      tone?: string;
+      sections?: any[];
+      fullMarkdown?: string;
+    },
+    bannerText: string,
+    activityVerb = 'Generated document'
+  ) => {
+    const now = new Date().toISOString();
+    const newDocId = `doc_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`;
+    const safeCategory = String(generated.category || documentType).slice(0, 64);
+    const safeTone = String(generated.tone || 'AI-Directed').slice(0, 64);
+    const safeLength = effectivePageCount.slice(0, 64);
+
+    const newRecord: DocumentRecord = {
+      id: newDocId,
+      ownerId: currentUser?.uid || 'guest_engineer_demo',
+      title: String(generated.title || title.trim()).slice(0, 256),
+      subtitle: String(generated.subtitle || '').slice(0, 512),
+      category: safeCategory,
+      tone: safeTone,
+      length: safeLength,
+      sections: Array.isArray(generated.sections) ? generated.sections : [],
+      content: String(generated.fullMarkdown || ''),
+      createdAt: now,
+      updatedAt: now,
+    };
+
+    // Always render the generated document in the preview immediately,
+    // even if Cloud Firestore saving subsequently fails.
+    setCurrentDoc(newRecord);
+    setEditedContent(newRecord.content);
+    setIsEditing(false);
+
+    try {
+      await saveDocument(newRecord);
+      setHasPendingCloudSave(false);
+      if (currentUser?.uid) {
+        await logActivity(
+          currentUser.uid,
+          'document',
+          `${activityVerb} '${newRecord.title}' (${safeCategory})`,
+          newDocId,
+          'document'
+        );
+      }
+      setStatusBanner(bannerText);
+    } catch (saveErr) {
+      setHasPendingCloudSave(true);
+      setStatusBanner(null);
+      setErrorMessage(
+        toSafeUserFirestoreErrorMessage(
+          saveErr,
+          'Document generated, but saving failed. Please retry.'
+        )
+      );
+    }
+  };
+
+  //Retry saving the current document when a previous save attempt failed
+  const handleRetrySaveCurrentDoc = async () => {
+    if (!currentDoc) return;
+    setIsSaving(true);
+    setErrorMessage(null);
+    try {
+      const updatedRecord: DocumentRecord = {
+        ...currentDoc,
+        content: isEditing ? editedContent : currentDoc.content,
+        sections: parseMarkdownIntoSections(isEditing ? editedContent : currentDoc.content),
+        updatedAt: new Date().toISOString(),
+      };
+      await saveDocument(updatedRecord);
+      setCurrentDoc(updatedRecord);
+      setHasPendingCloudSave(false);
+      setIsEditing(false);
+      setStatusBanner(`Saved "${updatedRecord.title}" successfully.`);
+    } catch (err) {
+      setErrorMessage(
+        toSafeUserFirestoreErrorMessage(
+          err,
+          'Document generated, but saving failed. Please retry.'
+        )
+      );
+    } finally {
+      setIsSaving(false);
+    }
   };
 
   // Load Sample Document (Zero API Credits)
@@ -351,63 +516,81 @@ export const DocumentGeneratorPage: React.FC = () => {
       const sampleTitle =
         title.trim() || 'AI Engineering Workspace — System Architecture Report';
       const generated = getSampleDocumentData(sampleTitle, documentType, effectivePageCount);
-      const now = new Date().toISOString();
-      const newDocId = `doc_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`;
-      const safeCategory = documentType.slice(0, 64);
-      const safeLength = effectivePageCount.slice(0, 64);
-
-      const newRecord: DocumentRecord = {
-        id: newDocId,
-        ownerId: currentUser?.uid || 'guest_engineer_demo',
-        title: generated.title,
-        subtitle: generated.subtitle,
-        category: safeCategory,
-        tone: 'AI-Directed',
-        length: safeLength,
-        sections: generated.sections,
-        content: generated.fullMarkdown,
-        createdAt: now,
-        updatedAt: now,
-      };
-
-      await saveDocument(newRecord);
-      if (currentUser?.uid) {
-        await logActivity(
-          currentUser.uid,
-          'document',
-          `Loaded sample document '${newRecord.title}' (${safeCategory})`,
-          newDocId,
-          'document'
-        );
-      }
-
-      setCurrentDoc(newRecord);
-      setEditedContent(newRecord.content);
-      setIsEditing(false);
-      setStatusBanner(`Loaded sample document "${newRecord.title}".`);
-    } catch (err: any) {
-      setErrorMessage(err.message || 'Failed to load sample document.');
+      await persistGeneratedDocument(
+        {
+          ...generated,
+          category: documentType,
+          tone: 'AI-Directed',
+        },
+        `Loaded sample document "${generated.title}".`,
+        'Loaded sample document'
+      );
+    } catch (err) {
+      setErrorMessage(
+        toSafeUserFirestoreErrorMessage(
+          err,
+          'Document generated, but saving failed. Please retry.'
+        )
+      );
     } finally {
       setIsGenerating(false);
     }
   };
 
-  // Generate Document from Natural-Language Prompt
-  const handleGenerate = async (e: React.FormEvent) => {
-    e.preventDefault();
+  // Deterministic Offline Demo Document Generation (Zero AI API calls)
+  const runDemoDocumentGeneration = async () => {
+    if (generatingRef.current) return;
     if (!title.trim() || !prompt.trim()) {
       setErrorMessage('Document Title and Main Content / Instructions are required.');
       return;
     }
 
+    generatingRef.current = true;
     setErrorMessage(null);
+    setAiUnavailableError(null);
     setStatusBanner(null);
     setIsGenerating(true);
 
     try {
+      const demo = generateDemoDocumentData({
+        title: title.trim(),
+        documentType,
+        pageCount: effectivePageCount,
+        prompt: prompt.trim(),
+      });
+      await persistGeneratedDocument(
+        demo,
+        `[Demo Mode] Generated "${demo.title}" (${effectivePageCount}) locally without live Gemini API calls.`
+      );
+    } catch (err) {
+      setErrorMessage(
+        toSafeUserFirestoreErrorMessage(err, 'Failed to generate Demo Mode document.')
+      );
+    } finally {
+      generatingRef.current = false;
+      setIsGenerating(false);
+    }
+  };
+
+  // Live Gemini Document Generation
+  const runLiveDocumentGeneration = async () => {
+    if (generatingRef.current) return;
+    if (!title.trim() || !prompt.trim()) {
+      setErrorMessage('Document Title and Main Content / Instructions are required.');
+      return;
+    }
+
+    generatingRef.current = true;
+    setErrorMessage(null);
+    setAiUnavailableError(null);
+    setStatusBanner(null);
+    setIsGenerating(true);
+
+    try {
+      const headers = await getAiRequestHeaders();
       const res = await fetch('/api/ai/generate-document', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers,
         body: JSON.stringify({
           title: title.trim(),
           documentType,
@@ -416,52 +599,49 @@ export const DocumentGeneratorPage: React.FC = () => {
         }),
       });
 
-      const data = await res.json();
+      const data = await res.json().catch(() => null);
       if (!res.ok) {
-        throw new Error(data.error || 'Failed to generate document.');
+        const parsedErr = parseAiFailure(res.status, data, 'Failed to generate document.');
+        if (parsedErr.isQuotaOrTransient) {
+          setAiUnavailableError(parsedErr);
+          if (parsedErr.allModelsExhausted || parsedErr.recommendDemoMode) {
+            setExecutionMode('demo');
+          }
+        } else {
+          setErrorMessage(parsedErr.message);
+        }
+        return;
       }
 
-      const generated = data.data;
-      const now = new Date().toISOString();
-      const newDocId = `doc_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`;
-      const safeCategory = String(generated.category || documentType).slice(0, 64);
-      const safeTone = String(generated.tone || 'AI-Directed').slice(0, 64);
-      const safeLength = effectivePageCount.slice(0, 64);
-
-      const newRecord: DocumentRecord = {
-        id: newDocId,
-        ownerId: currentUser?.uid || 'guest_engineer_demo',
-        title: String(generated.title || title.trim()).slice(0, 256),
-        subtitle: String(generated.subtitle || '').slice(0, 512),
-        category: safeCategory,
-        tone: safeTone,
-        length: safeLength,
-        sections: Array.isArray(generated.sections) ? generated.sections : [],
-        content: String(generated.fullMarkdown || ''),
-        createdAt: now,
-        updatedAt: now,
-      };
-
-      await saveDocument(newRecord);
-      if (currentUser?.uid) {
-        await logActivity(
-          currentUser.uid,
-          'document',
-          `Generated document '${newRecord.title}' (${safeCategory})`,
-          newDocId,
-          'document'
-        );
+      const generated = data?.data;
+      if (!generated || typeof generated.fullMarkdown !== 'string') {
+        setErrorMessage('Server returned an incomplete document payload. Please retry.');
+        return;
       }
 
-      setCurrentDoc(newRecord);
-      setEditedContent(newRecord.content);
-      setIsEditing(false);
-      setStatusBanner(`Generated "${newRecord.title}" (${safeLength}).`);
-    } catch (err: any) {
-      console.error(err);
-      setErrorMessage(err.message || 'Error occurred while generating document.');
+      const usedModel = data?.modelUsed || 'gemini-3-flash-preview';
+      const fallbackNote = data?.modelFallbackNotice ? ` (${data.modelFallbackNotice})` : '';
+      await persistGeneratedDocument(
+        generated,
+        `Generated "${String(generated.title || title.trim())}" (${effectivePageCount}) using ${usedModel}.${fallbackNote}`
+      );
+    } catch (err) {
+      setErrorMessage(
+        toSafeUserFirestoreErrorMessage(err, 'Error occurred while generating document.')
+      );
     } finally {
+      generatingRef.current = false;
       setIsGenerating(false);
+    }
+  };
+
+  // Generate Document Submit
+  const handleGenerate = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (executionMode === 'demo') {
+      await runDemoDocumentGeneration();
+    } else {
+      await runLiveDocumentGeneration();
     }
   };
 
@@ -471,14 +651,28 @@ export const DocumentGeneratorPage: React.FC = () => {
     setIsSaving(true);
     setErrorMessage(null);
     try {
-      await updateDocument(currentDoc.id, { content: editedContent });
+      const updatedSections = parseMarkdownIntoSections(editedContent);
+      await updateDocument(currentDoc.id, {
+        content: editedContent,
+        sections: updatedSections,
+      });
       setCurrentDoc((prev) =>
-        prev ? { ...prev, content: editedContent, updatedAt: new Date().toISOString() } : null
+        prev
+          ? {
+              ...prev,
+              content: editedContent,
+              sections: updatedSections,
+              updatedAt: new Date().toISOString(),
+            }
+          : null
       );
+      setHasPendingCloudSave(false);
       setIsEditing(false);
       setStatusBanner('Saved document updates.');
-    } catch {
-      setErrorMessage('Failed to save document updates.');
+    } catch (err) {
+      setErrorMessage(
+        toSafeUserFirestoreErrorMessage(err, 'Failed to save document updates. Please retry.')
+      );
     } finally {
       setIsSaving(false);
     }
@@ -487,14 +681,21 @@ export const DocumentGeneratorPage: React.FC = () => {
   // Rename Document
   const handleRename = async () => {
     if (!currentDoc || !newName.trim()) return;
+    const trimmedName = newName.trim();
     try {
-      await updateDocument(currentDoc.id, { title: newName.trim() });
-      setCurrentDoc((prev) => (prev ? { ...prev, title: newName.trim() } : null));
-      setTitle(newName.trim());
+      await updateDocument(currentDoc.id, { title: trimmedName });
+      setCurrentDoc((prev) =>
+        prev ? { ...prev, title: trimmedName, updatedAt: new Date().toISOString() } : null
+      );
+      setTitle(trimmedName);
       setIsRenaming(false);
+      setErrorMessage(null);
       setStatusBanner('Document title updated.');
-    } catch {
-      setErrorMessage('Failed to rename document.');
+    } catch (err) {
+      setIsRenaming(false);
+      setErrorMessage(
+        toSafeUserFirestoreErrorMessage(err, 'Failed to rename document. Please retry.')
+      );
     }
   };
 
@@ -515,10 +716,15 @@ export const DocumentGeneratorPage: React.FC = () => {
       }
       setCurrentDoc(null);
       setEditedContent('');
+      setHasPendingCloudSave(false);
       setIsDeleteModalOpen(false);
+      setErrorMessage(null);
       setStatusBanner('Document deleted.');
-    } catch {
-      setErrorMessage('Failed to delete document.');
+    } catch (err) {
+      setIsDeleteModalOpen(false);
+      setErrorMessage(
+        toSafeUserFirestoreErrorMessage(err, 'Failed to delete document. Please retry.')
+      );
     } finally {
       setIsDeleting(false);
     }
@@ -637,13 +843,55 @@ export const DocumentGeneratorPage: React.FC = () => {
         )}
       </div>
 
+      <AgentModeBar
+        mode={executionMode}
+        onModeChange={(nextMode) => {
+          setExecutionMode(nextMode);
+          setAiUnavailableError(null);
+          setErrorMessage(null);
+        }}
+        agentRole="synthesis"
+        disabled={isGenerating}
+        accentColor="indigo"
+      />
+
+      {aiUnavailableError && (
+        <AiUnavailableBanner
+          errorInfo={aiUnavailableError}
+          isBusy={isGenerating}
+          onRetryLive={() => {
+            void runLiveDocumentGeneration();
+          }}
+          onSwitchToDemoAndRun={() => {
+            setExecutionMode('demo');
+            setAiUnavailableError(null);
+            setErrorMessage(null);
+            void runDemoDocumentGeneration();
+          }}
+          onDismiss={() => setAiUnavailableError(null)}
+        />
+      )}
+
       {errorMessage && (
         <div
           role="alert"
-          className="p-3.5 rounded-lg bg-rose-950/40 border border-rose-500/30 text-rose-200 text-xs flex items-center gap-2.5"
+          className="p-3.5 rounded-lg bg-rose-950/40 border border-rose-500/30 text-rose-200 text-xs flex items-center justify-between gap-2.5"
         >
-          <AlertCircle size={16} className="text-rose-400 shrink-0" />
-          <span>{errorMessage}</span>
+          <div className="flex items-center gap-2.5">
+            <AlertCircle size={16} className="text-rose-400 shrink-0" />
+            <span>{errorMessage}</span>
+          </div>
+          {currentDoc && hasPendingCloudSave && (
+            <button
+              type="button"
+              onClick={handleRetrySaveCurrentDoc}
+              disabled={isSaving}
+              data-testid="retry-save-document-button"
+              className="px-3 py-1 rounded-md bg-rose-500/20 hover:bg-rose-500/30 border border-rose-500/40 text-rose-100 text-[11px] font-semibold shrink-0 transition-colors cursor-pointer"
+            >
+              {isSaving ? 'Saving...' : 'Retry Save'}
+            </button>
+          )}
         </div>
       )}
 
@@ -790,7 +1038,11 @@ export const DocumentGeneratorPage: React.FC = () => {
                 ) : (
                   <>
                     <Wand2 size={15} />
-                    <span>Generate Document</span>
+                    <span>
+                      {executionMode === 'demo'
+                        ? 'Generate Document (Demo Mode)'
+                        : 'Generate Document'}
+                    </span>
                   </>
                 )}
               </button>
@@ -871,7 +1123,10 @@ export const DocumentGeneratorPage: React.FC = () => {
 
                     <div className="my-5 border-b border-zinc-800" />
 
-                    <MarkdownDocumentPreview content={currentDoc.content} />
+                    <MarkdownDocumentPreview
+                      content={currentDoc.content}
+                      documentTitle={currentDoc.title}
+                    />
                   </div>
                 )}
               </div>
